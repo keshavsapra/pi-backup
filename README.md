@@ -24,7 +24,7 @@ Run one command and a friendly setup wizard walks you through everything:
 
 No editing cron jobs by hand. No terminal wizardry. Just answer the questions and you're done.
 
-<img width="597" height="282" alt="image" src="https://github.com/user-attachments/assets/02e4c379-c7ad-405c-bd50-ec37609722cb" /> <img width="588" height="414" alt="image" src="https://github.com/user-attachments/assets/fa51b9a2-5aaa-456f-9170-c4148e73359c" /> <img width="588" height="414" alt="image" src="https://github.com/user-attachments/assets/150df715-c309-45af-8f29-a638f623a143" /> <img width="588" height="414" alt="image" src="https://github.com/user-attachments/assets/c2e9dbcf-8bea-4b39-a4ff-3b0d09580ac6" /> <img width="588" height="422" alt="image" src="https://github.com/user-attachments/assets/cd25c3dc-3478-4fa1-a7f4-64633dce0061" />
+<img width="450" height="282" alt="image" src="https://github.com/user-attachments/assets/02e4c379-c7ad-405c-bd50-ec37609722cb" /> <img width="450" height="414" alt="image" src="https://github.com/user-attachments/assets/fa51b9a2-5aaa-456f-9170-c4148e73359c" /> <img width="450" height="414" alt="image" src="https://github.com/user-attachments/assets/150df715-c309-45af-8f29-a638f623a143" /> <img width="450" height="414" alt="image" src="https://github.com/user-attachments/assets/c2e9dbcf-8bea-4b39-a4ff-3b0d09580ac6" /> <img width="450" height="422" alt="image" src="https://github.com/user-attachments/assets/cd25c3dc-3478-4fa1-a7f4-64633dce0061" />
 
 
 
