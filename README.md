@@ -1,4 +1,9 @@
 # 🍓 Pi Backup
+![Platform](https://img.shields.io/badge/platform-Raspberry%20Pi-c51a4a)
+![Shell](https://img.shields.io/badge/shell-bash-89e051)
+![License](https://img.shields.io/badge/license-MIT-blue)
+![Works on](https://img.shields.io/badge/Pi%20OS-Bookworm%20%7C%20Bullseye-brightgreen)
+![Made with](https://img.shields.io/badge/made%20with-curiosity-orange)
 
 > **One command. A full backup wizard. No engineering degree required.**
 
