@@ -1,7 +1,7 @@
 #!/bin/bash
 # ============================================================
 #  Pi Backup Installer
-#  Usage: bash <(curl -fsSL https://raw.githubusercontent.com/YOU/REPO/main/pi-backup-install.sh)
+#  Usage: sudo bash <(curl -fsSL https://raw.githubusercontent.com/keshavsapra/pi-backup/refs/heads/main/pi-backup-install.sh)
 # ============================================================
 
 set -e
