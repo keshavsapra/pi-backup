@@ -1,0 +1,19 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: bash syntax check
+        run: |
+          bash -n pi-backup
+          bash -n pi-backup-install.sh
+          bash -n test/run-tests.sh
+      - name: functional test suite (sandboxed)
+        run: bash test/run-tests.sh

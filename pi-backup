@@ -1,0 +1,2172 @@
+#!/usr/bin/env bash
+# ============================================================================
+#  pi-backup — one-command backup & restore wizard for Raspberry Pi
+#  https://github.com/keshavsapra/pi-backup
+#
+#  v2: a proper CLI. The wizard only *installs* it; everything after that is
+#      `pi-backup backup|list|verify|restore|status|doctor|delete|...`
+#
+#  Requires: bash, GNU tar, coreutils, util-linux (flock/stat).
+#  whiptail is only needed for `wizard` and `config edit`.
+#
+#  Copyright (c) Keshav Sapra — MIT license.
+# ============================================================================
+VERSION="2.0.0"
+
+# ── paths ───────────────────────────────────────────────────────────────────
+LOG_DIR="/var/log"
+BIN_PATH="/usr/local/bin/pi-backup"
+UPSTREAM_URL="https://raw.githubusercontent.com/keshavsapra/pi-backup/main/pi-backup"
+
+# Overridable for sandboxed tests (documented in test/run-tests.sh):
+CONF_FILE="${PI_BACKUP_CONF:-/etc/pi-backup/pi-backup.conf}"
+TESTING="${PI_BACKUP_TESTING:-0}"
+
+# ── globals set by CLI flags ────────────────────────────────────────────────
+QUIET=0
+VERBOSE=0
+ASSUME_YES=0
+SUB=""
+REST=()
+
+# ── colours (disabled when not a TTY or NO_COLOR is set) ────────────────────
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+  C_B="\033[1m";  C_R="\033[31m"; C_G="\033[32m"; C_Y="\033[33m"
+  C_C="\033[36m"; C_D="\033[2m";  C_0="\033[0m"
+else
+  C_B=""; C_R=""; C_G=""; C_Y=""; C_C=""; C_D=""; C_0=""
+fi
+
+# ============================================================================
+#  small utilities
+# ============================================================================
+info()    { printf '%b %s\n' "${C_C}▸${C_0}" "$*"; }
+ok()      { printf '%b %s\n' "${C_G}✓${C_0}" "$*"; }
+warn()    { printf '%b %s\n' "${C_Y}⚠${C_0}" "$*" >&2; }
+err()     { printf '%b %s%b\n' "${C_R}✗ " "$*" "$C_0" >&2; }
+hint()    { printf '%b   %s%b\n' "$C_D" "$*" "$C_0"; }
+
+die() { # die EXITCODE MESSAGE...
+  local rc="$1"; shift
+  err "$*"
+  exit "$rc"
+}
+
+usage_err() {
+  err "$*"
+  printf "\nRun '%spi-backup help%s' for usage.\n" "$C_B" "$C_0" >&2
+  exit 2
+}
+
+human_size() { # human_size BYTES
+  local bytes="$1"
+  if (( bytes >= 1073741824 )); then
+    printf '%.1fG' "$(awk "BEGIN{printf \"%.2f\", $bytes/1073741824}")"
+  elif (( bytes >= 1048576 )); then
+    printf '%.1fM' "$(awk "BEGIN{printf \"%.2f\", $bytes/1048576}")"
+  elif (( bytes >= 1024 )); then
+    printf '%.1fK' "$(awk "BEGIN{printf \"%.2f\", $bytes/1024}")"
+  else
+    printf '%dB' "$bytes"
+  fi
+}
+
+json_escape() {
+  local out="$1"
+  out="${out//\\/\\\\}"
+  out="${out//\"/\\\"}"
+  out="${out//$'\n'/\\n}"
+  out="${out//$'\r'/\\r}"
+  out="${out//$'\t'/\\t}"
+  printf '%s' "$out"
+}
+
+confirm() { # confirm QUESTION -> 0 if yes (honours --yes)
+  local question="$1"
+  if (( ASSUME_YES )); then
+    ok "…${question} [assumed yes]"
+    return 0
+  fi
+  local reply
+  read -r -p "$(printf '%b?%b %s [y/N] ' "$C_Y" "$C_0" "$question")" reply
+  [[ "$reply" =~ ^[Yy]([Ee][Ss])?$ ]]
+}
+
+# comma-separated helpers ----------------------------------------------------
+split_csv() { # split_csv STRING -> CSV_ITEMS[]
+  CSV_ITEMS=()
+  local IFS=','
+  read -r -a CSV_ITEMS <<< "$1"
+}
+
+join_csv() { # join_csv ARGS -> comma-joined on stdout
+  local IFS=','
+  printf '%s' "$*"
+}
+
+dedupe_csv_append() { # dedupe_csv_append CURRENT NEW -> joined stdout
+  local current="$1" new="$2" out=() item found
+  split_csv "$current"
+  out=("${CSV_ITEMS[@]}")
+  split_csv "$new"
+  for item in "${CSV_ITEMS[@]}"; do
+    [[ -z "$item" ]] && continue
+    found=0
+    local have
+    for have in "${out[@]}"; do
+      [[ "$have" == "$item" ]] && { found=1; break; }
+    done
+    (( found )) || out+=("$item")
+  done
+  join_csv "${out[@]}"
+}
+
+# ============================================================================
+#  configuration
+#
+#  The config is plain KEY="value" lines parsed key-by-key — nothing is ever
+#  eval'd or sourced, so a corrupted config file cannot execute code.
+# ============================================================================
+CONF_KEYS=(PREFIX DEST INCLUDES EXCLUDES RETAIN_DAYS RETAIN_MIN COMPRESS VERIFY
+           PKG_LIST SCHEDULER SCHEDULE HOUR DOW DOM RANDOM_DELAY SERVICES_STOP
+           LOG_FILE ALLOW_ROOT_DEV)
+
+# defaults — replaced by load_conf() when a config file exists
+PREFIX="pi"
+DEST=""
+INCLUDES="etc,home,usr/local/bin,opt,boot/firmware"
+EXCLUDES="home/*/.cache,home/*/.local/share/Trash"
+RETAIN_DAYS=90
+RETAIN_MIN=3
+COMPRESS="gzip"
+VERIFY="true"
+PKG_LIST="true"
+SCHEDULER="systemd"
+SCHEDULE="daily"
+HOUR=2
+DOW=0
+DOM=1
+RANDOM_DELAY=15
+SERVICES_STOP=""
+LOG_FILE=""
+ALLOW_ROOT_DEV="false"
+
+_is_conf_key() {
+  local k
+  for k in "${CONF_KEYS[@]}"; do [[ "$k" == "$1" ]] && return 0; done
+  return 1
+}
+
+load_conf() { # load_conf [FILE]
+  local file="${1:-$CONF_FILE}"
+  [[ -r "$file" ]] || die 4 "No configuration found at $file — run: ${C_B}sudo pi-backup wizard${C_0}"
+
+  local line key val lineno=0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    ((lineno++))
+    [[ "$line" =~ ^[[:space:]]*$ || "$line" =~ ^[[:space:]]*# ]] && continue
+    if [[ ! "$line" =~ ^[[:space:]]*([A-Z_]+)=\"(.*)\"[[:space:]]*$ ]]; then
+      die 4 "$file line $lineno is malformed: \"$line\" — lines must look like KEY=\"value\""
+    fi
+    key="${BASH_REMATCH[1]}"
+    val="${BASH_REMATCH[2]}"
+    _is_conf_key "$key" || die 4 "$file line $lineno: unknown setting \"$key\""
+    case "$key" in
+      PREFIX)         PREFIX="$val" ;;
+      DEST)           DEST="$val" ;;
+      INCLUDES)       INCLUDES="$val" ;;
+      EXCLUDES)       EXCLUDES="$val" ;;
+      RETAIN_DAYS)    RETAIN_DAYS="$val" ;;
+      RETAIN_MIN)     RETAIN_MIN="$val" ;;
+      COMPRESS)       COMPRESS="$val" ;;
+      VERIFY)         VERIFY="$val" ;;
+      PKG_LIST)       PKG_LIST="$val" ;;
+      SCHEDULER)      SCHEDULER="$val" ;;
+      SCHEDULE)      SCHEDULE="$val" ;;
+      HOUR)           HOUR="$val" ;;
+      DOW)            DOW="$val" ;;
+      DOM)            DOM="$val" ;;
+      RANDOM_DELAY)   RANDOM_DELAY="$val" ;;
+      SERVICES_STOP)  SERVICES_STOP="$val" ;;
+      LOG_FILE)       LOG_FILE="$val" ;;
+      ALLOW_ROOT_DEV) ALLOW_ROOT_DEV="$val" ;;
+    esac
+  done < "$file"
+
+  validate_conf
+}
+
+validate_conf() {
+  [[ "$PREFIX" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] \
+    || die 4 "PREFIX \"$PREFIX\" is invalid — use letters, digits, '-' and '_'"
+  [[ "$DEST" == /* && "$DEST" != "/" ]] || die 4 "DEST must be an absolute path (not '/')"
+  [[ "$DEST" == */ ]] && DEST="${DEST%/}"
+  case "$COMPRESS" in
+    gzip|zstd|none) ;;
+    *) die 4 "COMPRESS must be gzip, zstd or none (found \"$COMPRESS\")" ;;
+  esac
+  if [[ "$COMPRESS" == "zstd" ]] && ! command -v zstd >/dev/null 2>&1; then
+    warn "COMPRESS=zstd but zstd is not installed — falling back to gzip"
+    COMPRESS="gzip"
+  fi
+  [[ "$VERIFY" == "true" || "$VERIFY" == "false" ]] || VERIFY="true"
+  [[ "$PKG_LIST" == "true" || "$PKG_LIST" == "false" ]] || PKG_LIST="true"
+  [[ "$ALLOW_ROOT_DEV" == "true" || "$ALLOW_ROOT_DEV" == "false" ]] || ALLOW_ROOT_DEV="false"
+  [[ "$RETAIN_DAYS" =~ ^[0-9]+$ ]] || RETAIN_DAYS=90
+  [[ "$RETAIN_MIN" =~ ^[0-9]+$ ]] || RETAIN_MIN=3
+  [[ "$SCHEDULE" =~ ^(daily|weekly|monthly)$ ]] || die 4 "SCHEDULE must be daily, weekly or monthly"
+  [[ "$SCHEDULER" == "systemd" || "$SCHEDULER" == "cron" ]] || SCHEDULER="systemd"
+  [[ "$HOUR" =~ ^[0-9]+$ && $HOUR -le 23 ]] || HOUR=2
+  [[ "$DOW" =~ ^[0-7]$ ]] || DOW=0
+  [[ "$DOM" =~ ^[0-9]+$ && $DOM -ge 1 && $DOM -le 28 ]] || DOM=1
+  [[ "$RANDOM_DELAY" =~ ^[0-9]+$ ]] || RANDOM_DELAY=15
+  [[ -n "$LOG_FILE" ]] || LOG_FILE="${LOG_DIR}/${PREFIX}-backup.log"
+}
+
+save_conf() {
+  mkdir -p "$(dirname "$CONF_FILE")" || die 1 "Could not create $(dirname "$CONF_FILE")"
+  local tmp="$CONF_FILE.tmp.$$"
+  {
+    echo "# pi-backup configuration — managed by pi-backup v$VERSION"
+    echo "# Edit: sudo pi-backup config edit   |   Reconfigure: sudo pi-backup wizard"
+    local k
+    for k in "${CONF_KEYS[@]}"; do
+      printf '%s="%s"\n' "$k" "${!k}"
+    done
+  } > "$tmp" || die 1 "Could not write $tmp"
+  chmod 0640 "$tmp"
+  mv "$tmp" "$CONF_FILE" || die 1 "Could not move the new config into place"
+}
+
+
+# ============================================================================
+#  environment & safety helpers
+# ============================================================================
+ensure_root() {
+  [[ $EUID -eq 0 || "$TESTING" == "1" ]] || \
+    die 1 "This needs root. Try: ${C_B}sudo pi-backup ${SUB:-}${C_0}"
+}
+
+require_deps() {
+  local d
+  for d in tar sha256sum flock stat du find df date awk; do
+    command -v "$d" >/dev/null 2>&1 || die 1 "Required tool \"$d\" is missing"
+  done
+}
+
+# The destination must live on a different block device than /
+check_dest_is_not_root_dev() {
+  local dev_dest dev_root
+  dev_dest="$(stat -Lc %d "$DEST" 2>/dev/null)"
+  if [[ -z "$dev_dest" ]]; then
+    mkdir -p "$DEST" 2>/dev/null || die 4 "DEST \"$DEST\" does not exist and cannot be created"
+    dev_dest="$(stat -Lc %d "$DEST")"
+  fi
+  dev_root="$(stat -Lc %d /)"
+  if [[ "$dev_dest" == "$dev_root" ]]; then
+    if [[ "$ALLOW_ROOT_DEV" == "true" ]]; then
+      warn "Backing up onto the root filesystem (ALLOW_ROOT_DEV=true) — prefer external storage"
+    elif [[ "$TESTING" == "1" ]]; then
+      : # sandbox tests always live on the same device
+    else
+      die 4 "\"$DEST\" sits on the root filesystem, not a separate mounted drive.
+   Your SD card would back itself up — slow and useless.
+   Mount an external drive, or set ALLOW_ROOT_DEV=true in the config to override."
+    fi
+  fi
+  mkdir -p "$DEST" 2>/dev/null || true
+  [[ -d "$DEST" && -w "$DEST" ]] || die 4 "DEST is not a writable directory: $DEST"
+}
+
+check_dest_not_inside_includes() {
+  split_csv "$INCLUDES"
+  local item
+  for item in "${CSV_ITEMS[@]}"; do
+    item="${item#/}"
+    [[ -z "$item" ]] && continue
+    if [[ "$DEST/" == "/$item/"* ]]; then
+      die 4 "Backup destination $DEST lives inside include path /$item —
+  the backup would grow every run. Pick a destination outside your backup set."
+    fi
+  done
+}
+
+free_bytes() { # free space (bytes) available at $1
+  df -B1 --output=avail "$1" 2>/dev/null | awk 'NR==2{print $1}'
+}
+
+included_bytes() { # approximate total size of include paths, in bytes
+  local total=0 n item
+  split_csv "$INCLUDES"
+  for item in "${CSV_ITEMS[@]}"; do
+    item="${item#/}"
+    [[ -n "$item" && -e "/$item" ]] || continue
+    n="$(du -sB1 "/$item" 2>/dev/null | awk '{print $1}')"
+    n="${n:-0}"
+    total=$(( total + n ))
+  done
+  if [[ -n "${PI_BACKUP_FAKE_SRC_BYTES:-}" ]]; then
+    total="$PI_BACKUP_FAKE_SRC_BYTES"
+  fi
+  printf '%s' "$total"
+}
+
+# ============================================================================
+#  logging
+# ============================================================================
+log_write() { # log_write LEVEL MESSAGE
+  if [[ -n "$LOG_FILE" && -w "$(dirname "$LOG_FILE")" ]]; then
+    printf '%s [%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" "$2" >>"$LOG_FILE"
+  fi
+}
+blog() { # print to console (honours --quiet) and append to the log file
+  log_write INFO "$*"
+  if (( ! QUIET )); then
+    printf '%s\n' "$*"
+  fi
+}
+
+# ============================================================================
+#  archive helpers
+# ============================================================================
+# ARCHIVE_LIST[] : absolute paths, newest first (timestamp is in the name)
+list_archives() {
+  ARCHIVE_LIST=()
+  local name
+  while IFS= read -r name; do
+    ARCHIVE_LIST+=("$DEST/$name")
+  done < <(find "$DEST" -maxdepth 1 -type f -name "${PREFIX}-backup-*.tar*" \
+             -not -name '*.sha256' -not -name '*.manifest' \
+             -printf '%f\n' 2>/dev/null | sort -r)
+}
+
+archive_count() {
+  list_archives
+  printf '%s' "${#ARCHIVE_LIST[@]}"
+}
+
+# sets COMPR_ARR=() with the tar read/create flag for this archive
+compr_opts() {
+  case "$1" in
+    *.tar.gz|*.tgz)   COMPR_ARR=(--gzip) ;;
+    *.tar.zst|*.tzst) COMPR_ARR=(--zstd) ;;
+    *)                COMPR_ARR=() ;;
+  esac
+}
+
+archive_integrity_ok() { # 0 = structurally intact
+  local f="$1"
+  compr_opts "$f"
+  tar "${COMPR_ARR[@]}" -tf "$f" >/dev/null 2>&1
+}
+
+archive_checksum_ok() { # 0 = sidecar .sha256 exists and matches
+  local f="$1" base
+  base="$(basename "$f")"
+  [[ -f "$DEST/$base.sha256" ]] || return 1
+  ( cd "$DEST" && sha256sum --quiet -c "$base.sha256" >/dev/null 2>&1 )
+}
+
+manifest_of() { # manifest_of ARCHIVE -> path to its .manifest
+  local base="$1"
+  base="${base%.tar.gz}"; base="${base%.tar.zst}"; base="${base%.tar}"
+  printf '%s.manifest' "$base"
+}
+
+manifest_value() { # manifest_value MANIFEST KEY -> value
+  grep -m1 "^$1=" "$2" 2>/dev/null | cut -d= -f2-
+}
+
+# resolve_archive "latest"|"NAME" -> echoes absolute path
+resolve_archive() {
+  local want="$1" f
+  list_archives
+  if [[ "$want" == "latest" || -z "$want" ]]; then
+    if (( ${#ARCHIVE_LIST[@]} == 0 )); then
+      err "No backups found in $DEST (prefix \"$PREFIX\")"
+      return 1
+    fi
+    printf '%s' "${ARCHIVE_LIST[0]}"
+    return 0
+  fi
+  for f in "${ARCHIVE_LIST[@]}"; do
+    [[ "$(basename "$f")" == "$want" ]] && { printf '%s' "$f"; return 0; }
+  done
+  err "Backup not found: $want  (like: pi-backup list)"
+  return 1
+}
+
+# prune archives (and their sidecars) older than RETAIN_DAYS but always keep
+# the newest RETAIN_MIN archives. Also removes orphaned sidecars/package lists.
+prune_backups() {
+  local cutoff=$(( $(date +%s) - RETAIN_DAYS * 86400 ))
+  local keep=0 deleted=0 f mtime
+  # NB: the timestamp is inside the name (…-YYYYMMDD-HHMMSS) so a lexicographic
+  # sort is already newest-first.
+  while IFS= read -r f; do
+    if (( keep < RETAIN_MIN )); then
+      keep=$(( keep + 1 ))
+      continue
+    fi
+    mtime="$(date -r "$DEST/$f" +%s 2>/dev/null || echo 0)"
+    if (( mtime < cutoff )); then
+      rm -f "$DEST/$f" "$DEST/$f.sha256" "$(manifest_of "$DEST/$f")"
+      deleted=$(( deleted + 1 ))
+      blog "Pruned $f (older than ${RETAIN_DAYS}d)"
+    fi
+  done < <(find "$DEST" -maxdepth 1 -type f -name "${PREFIX}-backup-*.tar*" \
+             -not -name '*.sha256' -not -name '*.manifest' \
+             -printf '%f\n' 2>/dev/null | sort -r)
+
+  # orphaned sidecars: .sha256/.manifest with no archive behind them
+  while IFS= read -r f; do
+    case "$f" in
+      *.sha256)
+        arch="${f%.sha256}"
+        [[ -f "$DEST/$arch" ]] || { rm -f "$DEST/$f"; blog "Pruned sidecar without archive: $f"; }
+        ;;
+      *.manifest)
+        stem="${f%.manifest}"
+        if ! ls "$DEST/$stem".tar* >/dev/null 2>&1; then
+          rm -f "$DEST/$f"
+          blog "Pruned sidecar without archive: $f"
+        fi
+        ;;
+    esac
+  done < <(find "$DEST" -maxdepth 1 -type f \( -name '*.sha256' -o -name '*.manifest' \) -printf '%f\n' 2>/dev/null)
+
+  # orphaned package lists: packages-<ts>.txt with no matching archive
+  local ts
+  while IFS= read -r ts; do
+    ts="${ts#"${PREFIX}"-packages-}"; ts="${ts%.txt}"
+    [[ "$ts" =~ ^[0-9]{8}-[0-9]{6}$ ]] || continue
+    if ! ls "$DEST/${PREFIX}-backup-$ts".tar* >/dev/null 2>&1; then
+      rm -f "$DEST/${PREFIX}-packages-$ts.txt"
+      blog "Pruned package list without archive: ${PREFIX}-packages-$ts.txt"
+    fi
+  done < <(find "$DEST" -maxdepth 1 -type f -name "${PREFIX}-packages-*.txt" -printf '%f\n' 2>/dev/null)
+}
+
+
+# ============================================================================
+#  scheduler — systemd timer (preferred) with cron fallback
+#  Unit names embed the prefix so several configs can coexist.
+# ============================================================================
+unit_service() { printf 'pi-backup-%s.service' "$PREFIX"; }
+unit_timer()   { printf 'pi-backup-%s.timer'   "$PREFIX"; }
+
+schedule_calendar() { # systemd OnCalendar value
+  local day_names=(Sun Mon Tue Wed Thu Fri Sat)
+  case "$SCHEDULE" in
+    daily)   printf '*-*-* %02d:00:00' "$HOUR" ;;
+    weekly)  printf '%s *-*-* %02d:00:00' "${day_names[$((DOW % 7))]}" "$HOUR" ;;
+    monthly) printf '*-*-%02d %02d:00:00' "$DOM" "$HOUR" ;;
+  esac
+}
+
+dom_suffix() {
+  case "$1" in
+    1|21)    echo st ;;
+    2|22)    echo nd ;;
+    3|23)    echo rd ;;
+    *)       echo th ;;
+  esac
+}
+
+schedule_human() {
+  local day_names=(Sunday Monday Tuesday Wednesday Thursday Friday Saturday Sunday)
+  local hh
+  hh="$(printf '%02d' "$HOUR")"
+  case "$SCHEDULE" in
+    daily)   printf 'daily at %s:00' "$hh" ;;
+    weekly)  printf 'every %s at %s:00' "${day_names[$((DOW % 7))]}" "$hh" ;;
+    monthly) printf 'monthly on the %s%s at %s:00' "$DOM" "$(dom_suffix "$DOM")" "$hh" ;;
+  esac
+}
+
+write_scheduler_units() {
+  if [[ "$TESTING" == "1" ]]; then
+    info "[test] would write /etc/systemd/system/$(unit_service) and $(unit_timer)"
+    return 0
+  fi
+  local calendar
+  calendar="$(schedule_calendar)"
+  cat > "/etc/systemd/system/$(unit_service)" <<EOF
+# Managed by pi-backup v$VERSION — do not edit by hand
+[Unit]
+Description=pi-backup "${PREFIX}" backup run
+
+[Service]
+Type=oneshot
+ExecStart=${BIN_PATH} backup --quiet
+TimeoutStartSec=infinity
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+EOF
+  cat > "/etc/systemd/system/$(unit_timer)" <<EOF
+# Managed by pi-backup v$VERSION — do not edit by hand
+[Unit]
+Description=Run pi-backup "${PREFIX}" ${SCHEDULE}
+
+[Timer]
+OnCalendar=$calendar
+RandomizedDelaySec=${RANDOM_DELAY}m
+Persistent=true
+Unit=$(unit_service)
+
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl daemon-reload 2>/dev/null || true
+  if ! systemctl enable --now "$(unit_timer)" >/dev/null 2>&1; then
+    warn "Installed $(unit_timer) but could not enable it (check: systemctl status $(unit_timer))"
+    return 1
+  fi
+  return 0
+}
+
+cron_marker() { printf '# pi-backup:t:%s' "$PREFIX"; }
+
+cron_install() {
+  local sched
+  case "$SCHEDULE" in
+    daily)   sched="0 $HOUR * * *" ;;
+    weekly)  sched="0 $HOUR * * $DOW" ;;
+    monthly) sched="0 $HOUR $DOM * *" ;;
+  esac
+  local line
+  line="$(cron_marker) $sched $BIN_PATH backup --quiet >> $LOG_FILE 2>&1"
+  if [[ "$TESTING" == "1" ]]; then
+    info "[test] would install cron entry: $line"
+    return 0
+  fi
+  if ! command -v crontab >/dev/null 2>&1; then
+    warn "crontab not found — schedule not installed"
+    return 1
+  fi
+  local tmp
+  tmp="$(mktemp)" || { warn "mktemp failed"; return 1; }
+  crontab -l 2>/dev/null | grep -v -F "$(cron_marker)" > "$tmp" || true
+  printf '%s\n' "$line" >> "$tmp"
+  if ! crontab "$tmp"; then
+    rm -f "$tmp"
+    warn "Could not write crontab"
+    return 1
+  fi
+  rm -f "$tmp"
+}
+
+scheduler_remove() {
+  if [[ "$SCHEDULER" == "systemd" ]] && command -v systemctl >/dev/null 2>&1; then
+    if [[ "$TESTING" == "1" ]]; then
+      info "[test] would disable+remove $(unit_timer) and $(unit_service)"
+    else
+      systemctl disable --now "$(unit_timer)" >/dev/null 2>&1 || true
+      rm -f "/etc/systemd/system/$(unit_timer)" "/etc/systemd/system/$(unit_service)"
+      systemctl daemon-reload 2>/dev/null || true
+    fi
+  elif command -v crontab >/dev/null 2>&1; then
+    if [[ "$TESTING" == "1" ]]; then
+      info "[test] would clear cron marker $(cron_marker)"
+    else
+      local tmp
+      tmp="$(mktemp)" || return 0
+      crontab -l 2>/dev/null | grep -v -F "$(cron_marker)" > "$tmp" || true
+      crontab "$tmp" 2>/dev/null || true
+      rm -f "$tmp"
+    fi
+  fi
+}
+
+scheduler_install() {
+  if [[ "$SCHEDULER" == "systemd" ]] && command -v systemctl >/dev/null 2>&1 && [[ -d /etc/systemd/system ]]; then
+    write_scheduler_units
+  else
+    cron_install
+  fi
+}
+
+scheduler_show() {
+  info "Schedule    : ${C_B}$(schedule_human)${C_0}  (${SCHEDULER})"
+  if [[ "$SCHEDULER" == "systemd" ]] && command -v systemctl >/dev/null 2>&1 && [[ -f "/etc/systemd/system/$(unit_timer)" ]]; then
+    hint "OnCalendar=$(schedule_calendar)  RandomizedDelaySec=${RANDOM_DELAY}m  Persistent=true"
+    local next
+    next="$(systemctl list-timers "$(unit_timer)" --no-pager 2>/dev/null | awk 'NR==2{print $1, $2, $3; exit}')"
+    [[ -n "$next" ]] && hint "Next run    : $next"
+    hint "Run now     : sudo systemctl start $(unit_service)"
+  elif [[ "$SCHEDULER" == "cron" ]] && command -v crontab >/dev/null 2>&1; then
+    local line
+    line="$(crontab -l 2>/dev/null | grep -F "$(cron_marker)" | head -1)"
+    [[ -n "$line" ]] && hint "crontab     : $line"
+  fi
+}
+
+# ============================================================================
+#  service stop/start around the backup (databases etc.)
+# ============================================================================
+STOPPED_SERVICES=()
+services_stop() {
+  [[ -n "$SERVICES_STOP" ]] || return 0
+  if ! command -v systemctl >/dev/null 2>&1; then
+    blog "WARN: systemctl missing; cannot stop $SERVICES_STOP — continuing"
+    return 0
+  fi
+  local svc
+  for svc in $SERVICES_STOP; do
+    if ! systemctl is-enabled "$svc" >/dev/null 2>&1 && ! systemctl is-active --quiet "$svc"; then
+      blog "Service $svc not found/running — nothing to stop"
+      continue
+    fi
+    if systemctl is-active --quiet "$svc"; then
+      if systemctl stop "$svc"; then
+        STOPPED_SERVICES+=("$svc")
+        blog "Stopped service: $svc"
+      else
+        blog "WARN: could not stop service $svc (continuing)"
+      fi
+    else
+      blog "Service $svc is already inactive"
+    fi
+  done
+}
+
+services_restart() {
+  local svc
+  for svc in ${STOPPED_SERVICES[@]+"${STOPPED_SERVICES[@]}"}; do
+    if systemctl start "$svc" >/dev/null 2>&1; then
+      blog "Restarted service: $svc"
+    else
+      blog "WARN: could not restart $svc — check with: systemctl status $svc"
+    fi
+  done
+  STOPPED_SERVICES=()
+}
+
+# ============================================================================
+#  exit cleanup — always: restart services, drop the lock, remove partials
+# ============================================================================
+CURRENT_ARCHIVE=""
+LOCK_FD=""
+LOCK_FILE=""
+KEEP_PARTIAL=0
+
+cleanup_on_exit() {
+  local rc="$?"
+  if (( ${#STOPPED_SERVICES[@]} )); then
+    services_restart
+  fi
+  if [[ -n "$CURRENT_ARCHIVE" && "$rc" -ne 0 && "$KEEP_PARTIAL" != "1" && -f "$CURRENT_ARCHIVE" ]]; then
+    rm -f "$CURRENT_ARCHIVE" "$CURRENT_ARCHIVE.sha256" "$CURRENT_ARCHIVE.manifest"
+    blog "Removed incomplete archive $(basename "$CURRENT_ARCHIVE")"
+  fi
+  if [[ -n "$LOCK_FD" ]]; then
+    exec 9>&-
+  fi
+  if [[ -n "$LOCK_FILE" && -f "$LOCK_FILE" ]]; then
+    rm -f "$LOCK_FILE"
+  fi
+  exit "$rc"
+}
+
+
+# ============================================================================
+#  pi-backup backup
+# ============================================================================
+cmd_backup() {
+  load_conf "$CONF_FILE"
+  ensure_root
+  require_deps
+
+  mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+  check_dest_is_not_root_dev
+  check_dest_not_inside_includes
+
+  # ── lock: never overlap two runs ─────────────────────────────────────────
+  LOCK_FILE="$DEST/.pi-backup.lock"
+  exec 9>"$LOCK_FILE" || { warn "cannot create lock file $LOCK_FILE"; return 3; }
+  if ! flock -n 9; then
+    err "Another pi-backup run is already in progress (pid $(cat "$LOCK_FILE" 2>/dev/null || echo '?'))."
+    hint "If you're sure nothing is running: rm -f $LOCK_FILE"
+    LOCK_FD=""
+    LOCK_FILE=""
+    exec 9>&-
+    return 3
+  fi
+  LOCK_FD=9
+  printf '%s' "$$" >&9
+  trap cleanup_on_exit EXIT
+
+  local TS
+  TS="$(date +%Y%m%d-%H%M%S)"
+  # never let a second-resolution timestamp collide with an existing backup:
+  # two fast successive runs would otherwise overwrite each other's archive.
+  local guard=0
+  while ls "$DEST/${PREFIX}-backup-${TS}".tar* >/dev/null 2>&1 || \
+        [[ -e "$DEST/${PREFIX}-backup-${TS}.manifest" ]] || \
+        [[ -e "$DEST/${PREFIX}-packages-${TS}.txt" ]]; do
+    sleep 1
+    TS="$(date +%Y%m%d-%H%M%S)"
+    guard=$(( guard + 1 )); (( guard > 10 )) && break
+  done
+  TAR_NAME="${PREFIX}-backup-${TS}"
+  blog "=== pi-backup v$VERSION — backup started $(date '+%F %T') ==="
+
+  # ── stop configured services around the backup ──────────────────────────
+  services_stop
+
+  # ── filter missing include paths (tar would abort rc=2) ─────────────────
+  split_csv "$INCLUDES"
+  local valid_includes=() missing=() item found
+  for item in "${CSV_ITEMS[@]}"; do
+    item="${item#/}"
+    [[ -z "$item" ]] && continue
+    found=0
+    local v
+    for v in ${valid_includes[@]+"${valid_includes[@]}"}; do
+      [[ "$v" == "$item" ]] && { found=1; break; }
+    done
+    (( found )) && continue
+    if [[ -e "/$item" ]]; then
+      valid_includes+=("$item")
+    else
+      missing+=("$item")
+    fi
+  done
+  for item in "${missing[@]+"${missing[@]}"}"; do
+    blog "WARN: include path /$item does not exist — skipped"
+  done
+  (( ${#valid_includes[@]} )) || { err "None of the include paths exist on this machine — fix INCLUDES in $CONF_FILE"; return 4; }
+
+  # ── exclude args ────────────────────────────────────────────────────────
+  local excl_args=() e
+  split_csv "$EXCLUDES"
+  for e in "${CSV_ITEMS[@]}"; do
+    [[ -z "$e" ]] && continue
+    excl_args+=("--exclude=$e")
+  done
+
+  # ── pre-flight: enough space at the destination? ────────────────────────
+  local src_free src_size hard_need
+  src_free="$(free_bytes "$DEST")"
+  src_size="$(included_bytes)"
+  if [[ -n "${PI_BACKUP_FAKE_FREE_BYTES:-}" ]]; then src_free="$PI_BACKUP_FAKE_FREE_BYTES"; fi
+  src_free="${src_free:-0}"
+  hard_need=$(( src_size * 8 / 10 ))   # tar.gz of a Pi tree is usually ≤ ~60-80% of source
+  blog "Source (approx): $(human_size "$src_size") · free at destination: $(human_size "$src_free")"
+  if (( hard_need > src_free )); then
+    err "Not enough space at $DEST"
+    err "  need ≥ $(human_size "$hard_need") (conservative estimate), have $(human_size "$src_free")"
+    hint "Free up space or prune old backups: pi-backup delete <name>"
+    return 5
+  elif (( src_size / 2 > src_free )); then
+    warn "Less than half of source size is free — backup probably still fits (tar.gz shrinks a lot) but consider pruning"
+  fi
+
+  # ── create the archive ──────────────────────────────────────────────────
+  local TAR="$DEST/$TAR_NAME"
+  local create_flags=()
+  case "$COMPRESS" in
+    gzip) TAR="$TAR.tar.gz";  create_flags=(--gzip) ;;
+    zstd) TAR="$TAR.tar.zst"; create_flags=(--zstd) ;;
+    none) TAR="$TAR.tar";     create_flags=() ;;
+  esac
+  CURRENT_ARCHIVE="$TAR"
+
+  blog "Creating $(basename "$TAR") from: ${valid_includes[*]}"
+  local t0=$SECONDS tar_rc=0
+  if (( VERBOSE )); then
+    tar -C / --create "${create_flags[@]}" --file="$TAR" \
+        --warning=no-file-changed "${excl_args[@]}" "${valid_includes[@]}" | tee -a "$LOG_FILE" >/dev/null
+    tar_rc=${PIPESTATUS[0]}
+  else
+    tar -C / --create "${create_flags[@]}" --file="$TAR" \
+        --warning=no-file-changed "${excl_args[@]}" "${valid_includes[@]}" >>"$LOG_FILE" 2>&1
+    tar_rc=$?
+  fi
+
+  # test hook to exercise the "files changed live" branch
+  [[ -n "${PI_BACKUP_FAKE_TAR_RC:-}" ]] && tar_rc="$PI_BACKUP_FAKE_TAR_RC"
+
+  if (( tar_rc == 1 )); then
+    # Files changed while tar was reading — normal on a live system: still fine
+    blog "NOTE: some files changed during backup (rc=1) — archive contains a consistent-enough snapshot"
+  elif (( tar_rc >= 2 )); then
+    err "tar failed (rc=$tar_rc) — details above / in $LOG_FILE"
+    return 6
+  fi
+
+  local dur=$(( SECONDS - t0 ))
+  local archive_bytes
+  archive_bytes="$(stat -c %s "$TAR")"
+  blog "Archive created in ${dur}s ($(human_size "$archive_bytes"))"
+
+  # ── sha256 sidecar (path-agnostic: relative names for -c checking) ──────
+  if ! ( cd "$DEST" && sha256sum "$(basename "$TAR")" > "$(basename "$TAR").sha256" ); then
+    err "Could not write checksum file"
+    return 1
+  fi
+
+  # ── verify ──────────────────────────────────────────────────────────────
+  local verify_state="skipped"
+  if [[ "$VERIFY" == "true" ]]; then
+    blog "Verifying archive…"
+    if archive_integrity_ok "$TAR" && archive_checksum_ok "$TAR"; then
+      verify_state="ok"
+      blog "Verify: OK"
+    else
+      err "Verification FAILED — archive may be corrupt. Deleting it rather than leaving a bad backup."
+      return 7
+    fi
+  fi
+
+  # ── package list ────────────────────────────────────────────────────────
+  local pkg_file=""
+  if [[ "$PKG_LIST" == "true" ]] && command -v dpkg >/dev/null 2>&1; then
+    pkg_file="$DEST/${PREFIX}-packages-${TS}.txt"
+    if dpkg --get-selections > "$pkg_file" 2>/dev/null; then
+      blog "Package list saved: $(basename "$pkg_file")"
+    else
+      pkg_file=""
+      blog "WARN: could not write package list"
+    fi
+  fi
+
+  # ── manifest (read by list/status/restore) ──────────────────────────────
+  {
+    printf 'version=%s\n' "$VERSION"
+    printf 'ts=%s\n' "$TS"
+    printf 'host=%s\n' "$(hostname 2>/dev/null || echo '?')"
+    printf 'kernel=%s\n' "$(uname -r)"
+    printf 'archive=%s\n' "$(basename "$TAR")"
+    printf 'archive_size=%s\n' "$archive_bytes"
+    printf 'duration=%s\n' "$dur"
+    printf 'includes=%s\n' "$(join_csv "${valid_includes[@]}")"
+    printf 'excludes=%s\n' "$EXCLUDES"
+    printf 'compress=%s\n' "$COMPRESS"
+    printf 'tar_rc=%s\n' "$tar_rc"
+    printf 'verify=%s\n' "$verify_state"
+    printf 'packages=%s\n' "$(basename "$pkg_file")"
+    printf 'status=ok\n'
+  } > "$DEST/${TAR_NAME}.manifest" || return 1
+
+  # ── retention ───────────────────────────────────────────────────────────
+  prune_backups
+
+  # ── summary ─────────────────────────────────────────────────────────────
+  if (( ! QUIET )); then
+    echo ""
+    printf "%b\n" "${C_G}${C_B}  ✓ Backup complete${C_0}"
+    printf "    Size: %s → %s\n" "$(human_size "$archive_bytes")" "$TAR"
+    printf "    Took %ss · destination still has %s free\n" "$dur" "$(human_size "$(free_bytes "$DEST")")"
+    printf "    Log: %s\n" "$LOG_FILE"
+    echo ""
+  fi
+  blog "=== pi-backup backup finished OK ==="
+
+  KEEP_PARTIAL=1   # archive is complete — the exit trap must not delete it
+  return 0
+}
+
+
+# ============================================================================
+#  pi-backup list [--json]
+# ============================================================================
+cmd_list() {
+  local json=0 a
+  for a in "${REST[@]+"${REST[@]}"}"; do
+    case "$a" in
+      --json) json=1 ;;
+      *) usage_err "list: unknown option $a" ;;
+    esac
+  done
+  load_conf "$CONF_FILE"
+  list_archives
+
+  if (( "${#ARCHIVE_LIST[@]}" == 0 )); then
+    if (( json )); then
+      echo "[]"
+    else
+      warn "No backups in $DEST matching prefix \"$PREFIX\""
+      hint "Create one:  sudo pi-backup backup"
+    fi
+    return 0
+  fi
+
+  local f base m verify pkg size
+  if (( json )); then
+    local json_str="[" first=1 item
+    for f in "${ARCHIVE_LIST[@]}"; do
+      base="$(basename "$f")"
+      m="$(manifest_of "$f")"
+      verify=""; pkg=""
+      [[ -f "$m" ]] && { verify="$(manifest_value verify "$m")"; pkg="$(manifest_value packages "$m")"; }
+      size="$(stat -c %s "$f" 2>/dev/null || echo 0)"
+      item="$(printf '{"name":"%s","size":%s,"human":"%s","verified":"%s","packages":"%s"}' \
+        "$(json_escape "$base")" "$size" "$(human_size "$size")" \
+        "$(json_escape "$verify")" "$(json_escape "$pkg")")"
+      (( first )) && json_str="$json_str$item" || json_str="$json_str,$item"
+      first=0
+    done
+    printf '%s]\n' "$json_str"
+    return 0
+  fi
+
+  printf "\n${C_B}Backups in %s${C_0}   ${C_D}(prefix: %s)${C_0}\n\n" "$DEST" "$PREFIX"
+  printf "  %-36s %9s   %-9s   %s\n" "ARCHIVE" "SIZE" "VERIFY" "PACKAGES"
+  local icon
+  for f in "${ARCHIVE_LIST[@]}"; do
+    base="$(basename "$f")"
+    m="$(manifest_of "$f")"
+    verify=""; pkg=""
+    [[ -f "$m" ]] && { verify="$(manifest_value verify "$m")"; pkg="$(manifest_value packages "$m")"; }
+    size="$(human_size "$(stat -c %s "$f" 2>/dev/null || echo 0)")"
+    case "$verify" in
+      ok)      icon="${C_G}✓ ok${C_0}" ;;
+      skipped) icon="${C_Y}— dash${C_0}" ;;
+      "")      icon="${C_Y}unknown${C_0}" ;;
+      *)       icon="${C_R}✗ $verify${C_0}" ;;
+    esac
+    printf "  %-36s %9s   %-19s   %s\n" "$base" "$size" "$icon" "${pkg:-—}"
+  done
+  echo ""
+}
+
+# ============================================================================
+#  pi-backup verify [name|latest|all]
+# ============================================================================
+cmd_verify() {
+  local target="latest"
+  [[ -n "${REST[0]:-}" ]] && target="${REST[0]}"
+  load_conf "$CONF_FILE"
+
+  if [[ "$target" == "all" ]]; then
+    list_archives
+    (( ${#ARCHIVE_LIST[@]} )) || { warn "No backups to verify"; return 0; }
+    local f fails=0
+    for f in "${ARCHIVE_LIST[@]}"; do
+      verify_one_message "$(basename "$f")" || fails=$(( fails + 1 ))
+    done
+    (( fails )) && { err "$fails of ${#ARCHIVE_LIST[@]} backup(s) FAILED verification"; return 7; }
+    ok "All ${#ARCHIVE_LIST[@]} backup(s) verified"
+    return 0
+  fi
+  verify_one_message "$target"
+}
+
+verify_one_message() { # verify_one_message NAME -> prints result; rc 7 on fail
+  local f
+  f="$(resolve_archive "$1")" || return 7
+  blog "Verifying $(basename "$f")…"
+  if ! archive_integrity_ok "$f"; then
+    err "$(basename "$f"): archive structure is damaged"
+    return 7
+  fi
+  if ! archive_checksum_ok "$f"; then
+    err "$(basename "$f"): checksum missing or mismatched"
+    return 7
+  fi
+  ok "$(basename "$f"): verified"
+}
+
+# ============================================================================
+#  whiptail helpers (shared by wizard + restore)
+#  Set _WT_VAL on success, return 1 when cancelled.
+# ============================================================================
+whiptail_available() {
+  command -v whiptail >/dev/null 2>&1 || return 1
+  [[ -t 1 || -t 2 ]]
+}
+
+ask_text()   { # ask_text "title" "prompt" HEIGHT WIDTH [default]
+  _WT_VAL="$(whiptail --title "$1" --inputbox "$2" "$3" "$4" "$5" 3>&1 1>&2 2>&3)" || return 1
+}
+ask_menu()   { # ask_menu "title" "prompt" HEIGHT WIDTH LINES item desc [item desc...]
+  local title="$1" prompt="$2" h="$3" w="$4" menu_lines="$5"; shift 5
+  _WT_VAL="$(whiptail --title "$title" --menu "$prompt" "$h" "$w" "$menu_lines" \
+             "$@" 3>&1 1>&2 2>&3)" || return 1
+}
+ask_radio()  { # like ask_menu but with a radiolist
+  local title="$1" prompt="$2" h="$3" w="$4" menu_lines="$5"; shift 5
+  _WT_VAL="$(whiptail --title "$title" --radiolist "$prompt" "$h" "$w" "$menu_lines" \
+             "$@" 3>&1 1>&2 2>&3)" || return 1
+}
+ask_check()  { # like ask_menu but with a checklist
+  local title="$1" prompt="$2" h="$3" w="$4" menu_lines="$5"; shift 5
+  _WT_VAL="$(whiptail --title "$title" --checklist "$prompt" "$h" "$w" "$menu_lines" \
+             "$@" 3>&1 1>&2 2>&3)" || return 1
+}
+ask_yesno()  { whiptail --title "$1" --yesno "$2" "$3" "$4" 3>&1 1>&2 2>&3; }
+ask_msg()    { whiptail --title "$1" --msgbox "$2" "$3" "$4" 3>&1 1>&2 2>&3; }
+
+clean_whiptail_list() { # strip the quotes whiptail returns:  "a" "b" -> a b
+  local s="$1"
+  s="${s//\"/ }"
+  printf '%s' "$s"
+}
+
+# ============================================================================
+#  pi-backup restore  [name|latest] — the star of the show
+#
+#  pi-backup restore                          interactive
+#  pi-backup restore latest --target /mnt/x   extract into a directory
+#  pi-backup restore latest --paths etc/nginx restore only some paths onto /
+#  pi-backup restore latest --packages        reinstall package list
+# ============================================================================
+RESTORE_MODE=""
+
+cmd_restore() {
+  local archive="latest" target="" paths="" force=0 snapshot=1 dry_run=0 no_verify=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --latest)     archive="latest" ;;
+      --target)     [[ $# -ge 2 ]] || usage_err "restore: --target needs a value"; target="$2"; shift ;;
+      --paths)      [[ $# -ge 2 ]] || usage_err "restore: --paths needs a value"; paths="$2"; shift ;;
+      --packages)   RESTORE_MODE="packages" ;;
+      --everything) RESTORE_MODE="everything" ;;
+      --force|-f)   force=1 ;;
+      --no-snapshot) snapshot=0 ;;
+      --no-verify)  no_verify=1 ;;
+      --dry-run)    dry_run=1 ;;
+      -*)           usage_err "restore: unknown option $1" ;;
+      *)            archive="$1" ;;
+    esac
+    shift
+  done
+
+  load_conf "$CONF_FILE"
+  ensure_root
+  require_deps
+
+  local ARCHIVE
+  ARCHIVE="$(resolve_archive "$archive")" || return $?
+  info "Archive : ${C_B}$(basename "$ARCHIVE")${C_0}"
+  info "Size    : $(human_size "$(stat -c %s "$ARCHIVE" 2>/dev/null || echo 0)")"
+
+  # verify before touching anything — cheap insurance
+  if (( ! no_verify )); then
+    if ! archive_integrity_ok "$ARCHIVE" || ! archive_checksum_ok "$ARCHIVE"; then
+      die 7 "Archive failed verification — refusing to restore from it.
+  (it may be corrupt; run: pi-backup list   and pick another)
+  (override with --no-verify)"
+    fi
+    ok "Archive verified"
+  fi
+
+  if [[ -z "$RESTORE_MODE" ]]; then
+    if [[ -n "$target" ]]; then
+      RESTORE_MODE="dir"
+    elif [[ -n "$paths" ]]; then
+      RESTORE_MODE="paths"
+    elif whiptail_available; then
+      RESTORE_MODE="$(restore_choose_menu)" || die 1 "Cancelled."
+    else
+      usage_err "restore: pass --target DIR, --paths LIST or --packages (no terminal for menus)"
+    fi
+  fi
+
+  case "$RESTORE_MODE" in
+    dir)        restore_to_dir "$ARCHIVE" "$target" "$force" "$dry_run" "$snapshot" ;;
+    paths)      restore_to_system "$ARCHIVE" "$paths" "$dry_run" "$snapshot" ;;
+    everything) restore_to_system "$ARCHIVE" "" "$dry_run" "$snapshot" ;;
+    packages)   restore_packages "$ARCHIVE" "$dry_run" ;;
+    *)          die 2 "Unknown restore mode \"$RESTORE_MODE\"" ;;
+  esac
+}
+
+restore_choose_menu() {
+  ask_menu "Pi Backup — Restore" \
+    "What would you like to restore?" 16 66 4 \
+    "everything" "Everything — whole archive onto this system (/)" \
+    "chosen"     "Just some paths — pick them next" \
+    "dir"        "Extract into a directory (system untouched)" \
+    "packages"   "Reinstall the saved package list" || return 1
+  case "$_WT_VAL" in
+    everything) printf 'everything' ;;
+    chosen)     printf 'paths' ;;
+    dir)        printf 'dir' ;;
+    packages)   printf 'packages' ;;
+  esac
+}
+
+restore_to_dir() { # restore_to_dir ARCHIVE TARGET FORCE DRY_SNAPSHOT_FLAG...
+  local ARCHIVE="$1" target="$2" force="$3" dry_run="$4" want_snapshot="$5"
+  if [[ -z "$target" ]]; then
+    if whiptail_available; then
+      ask_text "Extract to directory" \
+        "Extract everything into which directory?
+
+Nothing on the current system is touched." 9 60 "$HOME/pi-backup-restore" \
+        || die 1 "Cancelled."
+      target="$_WT_VAL"
+    else
+      usage_err "restore: dir mode needs --target DIR"
+    fi
+  fi
+  [[ "$target" == /* ]] || die 4 "--target must be an absolute path"
+  if [[ -d "$target" && -n "$(ls -A "$target" 2>/dev/null)" && "$force" != "1" ]]; then
+    die 4 "\"$target\" is not empty — pick a fresh empty directory, or pass --force
+  (with --force any files being overwritten are auto-snapshotted first)."
+  fi
+  (( dry_run )) || { mkdir -p "$target" || die 1 "Could not create $target"; }
+
+  if (( dry_run )); then
+    info "[dry-run] would extract $(human_size "$(stat -c %s "$ARCHIVE")") into $target"
+    return 0
+  fi
+
+  # snapshot whatever is about to be overwritten (only in --force mode)
+  if (( want_snapshot )) && (( force )) && [[ -n "$(ls -A "$target" 2>/dev/null)" ]]; then
+    guard_dir_snapshot "$ARCHIVE" "$target" || warn "Could not snapshot pre-restore state (continuing)"
+  fi
+
+  compr_opts "$ARCHIVE"
+  info "Extracting into $target — this can take a while…"
+  if tar "${COMPR_ARR[@]}" -xf "$ARCHIVE" -C "$target"; then
+    ok "Restored into $target"
+    hint "Inspect:  ls -la $target"
+  else
+    die 1 "Extraction failed — see tar errors above"
+  fi
+}
+
+
+# ============================================================================
+#  restoring onto the running system (paths mode)
+# ============================================================================
+top_level_members() { # top_level_members ARCHIVE -> top-level dirs/files, one per line
+  local ARCHIVE="$1"
+  compr_opts "$ARCHIVE"
+  tar "${COMPR_ARR[@]}" -tf "$ARCHIVE" 2>/dev/null | awk -F/ '{print $1}' | awk 'NF' | sort -u
+}
+
+normalise_restore_paths() { # normalise_restore_paths RAW -> REL_PATHS[]
+  local raw="$1" item out=()
+  raw="${raw//,/ }"; raw="${raw//\"/ }"
+  for item in $raw; do
+    item="${item#/}"
+    [[ -z "$item" ]] && continue
+    local seen=0 have
+    for have in ${out[@]+"${out[@]}"}; do
+      [[ "$have" == "$item" ]] && { seen=1; break; }
+    done
+    (( seen )) || out+=("$item")
+  done
+  REL_PATHS=("${out[@]}")
+}
+
+restore_to_system() { # restore_to_system ARCHIVE PATHS DRY RUN_SNAPSHOT
+  local ARCHIVE="$1" want_paths="$2" dry_run="$3" want_snapshot="$4"
+
+  if [[ -z "$want_paths" ]]; then
+    # "everything" mode: restore all top-level members from the archive
+    if [[ "$RESTORE_MODE" != "everything" ]] && whiptail_available; then
+      want_paths="$(restore_pick_paths_ui "$ARCHIVE")" || die 1 "Cancelled."
+      [[ -n "$want_paths" ]] || die 1 "Cancelled — nothing selected."
+    fi
+  fi
+  normalise_restore_paths "${want_paths:-}"
+  (( ${#REL_PATHS[@]} )) || { REL_PATHS=(); while IFS= read -r p; do REL_PATHS+=("$p"); done < <(top_level_members "$ARCHIVE"); }
+  (( ${#REL_PATHS[@]} )) || die 1 "Could not determine what to restore from this archive"
+
+  # snapshot the files that are about to be overwritten (survivable 'oops')
+  if (( want_snapshot && ! dry_run )); then
+    guard_system_snapshot "$ARCHIVE" "${REL_PATHS[@]}" || warn "Could not snapshot the files about to be replaced (continuing)"
+  fi
+
+  if (( dry_run )); then
+    info "[dry-run] would restore ${#REL_PATHS[@]} path(s) onto /:"
+    local p
+    for p in "${REL_PATHS[@]}"; do
+      printf '    /%s\n' "$p"
+    done
+    return 0
+  fi
+
+  typed_confirm_restore "${REL_PATHS[@]}" || die 1 "Cancelled — nothing was restored."
+
+  compr_opts "$ARCHIVE"
+  info "Restoring ${#REL_PATHS[@]} path(s) onto / ..."
+  if tar "${COMPR_ARR[@]}" -xf "$ARCHIVE" -C / -- "${REL_PATHS[@]}"; then
+    ok "Restored: ${REL_PATHS[*]}"
+    hint "If /etc was restored, reboot to apply everything."
+    hint "Packages:   pi-backup restore $(basename "$ARCHIVE") --packages"
+  else
+    die 1 "Restore failed — see tar errors above"
+  fi
+}
+
+restore_pick_paths_ui() { # checklist of top-level members
+  local ARCHIVE="$1" rows=() item
+  local i=0
+  while IFS= read -r item; do
+    [[ -n "$item" ]] || continue
+    if (( i < 12 )); then
+      rows+=("$item" "restore" "off")
+    fi
+    i=$(( i + 1 ))
+  done < <(top_level_members "$ARCHIVE")
+  (( ${#rows[@]} )) || die 1 "Could not list the archive's contents"
+  ask_check "Select paths to restore" \
+    "Toggle with [SPACE], then [ENTER].
+Wildcards, left out here, can be typed with --paths." 16 60 10 "${rows[@]}" || return 1
+  clean_whiptail_list "$_WT_VAL"
+}
+
+# snapshot files that exist on this system and are inside the restore set
+guard_system_snapshot() {
+  local ARCHIVE="$1"; shift
+  compr_opts "$ARCHIVE"
+  local seen_files=() members p root
+  mapfile -t members < <(tar "${COMPR_ARR[@]}" -tf "$ARCHIVE" 2>/dev/null | head -300000)
+  (( ${#members[@]} )) || return 1
+  for root in "$@"; do
+    root="${root#/}"
+    for p in "${members[@]}"; do
+      p="${p#/}"
+      case "$p" in
+        "$root"|"$root"/*) ;;
+        *) continue ;;
+      esac
+      [[ -f "/$p" ]] || continue
+      local dup=0 have
+      for have in ${seen_files[@]+"${seen_files[@]}"}; do
+        [[ "$have" == "$p" ]] && dup=1 && break
+      done
+      (( dup )) || seen_files+=("$p")
+    done
+  done
+  (( ${#seen_files[@]} )) || return 0
+  local guard
+  guard="$DEST/guard-$(date +%Y%m%d-%H%M%S).tar.gz"
+  blog "Snapshotting ${#seen_files[@]} file(s) that are about to be replaced → $(basename "$guard")"
+  if tar -C / -czf "$guard" -- "${seen_files[@]}" 2>/dev/null; then
+    blog "Guard snapshot saved: $guard (extract it with: tar -C / -xzf $(basename "$guard"))"
+    return 0
+  fi
+  rm -f "$guard"
+  return 1
+}
+
+# snapshot everything in a target directory before a --force overwrite
+guard_dir_snapshot() {
+  local target="$1"
+  local guard
+  guard="$DEST/guard-$(date +%Y%m%d-%H%M%S).tar.gz"
+  blog "Snapshotting pre-restore state of $target → $(basename "$guard")"
+  if tar -C "$target" -czf "$guard" . 2>/dev/null; then
+    blog "Guard snapshot saved: $guard"
+    return 0
+  fi
+  rm -f "$guard"
+  return 1
+}
+
+typed_confirm_restore() {
+  echo ""
+  warn "${C_B}These paths are about to be overwritten on the RUNNING system:${C_0}"
+  printf "    /%s\n" "$@"
+  echo ""
+  if (( ASSUME_YES )); then
+    ok "Assumed yes (--yes)"
+    return 0
+  fi
+  local ans
+  read -r -p "$(printf '%s?%s Type %sRESTORE%s to continue (anything else aborts): ' "$C_Y" "$C_0" "$C_B" "$C_0")" ans
+  [[ "$ans" == "RESTORE" ]]
+}
+
+# ============================================================================
+#  package list restore
+# ============================================================================
+restore_packages() { # restore_packages ARCHIVE DRY_RUN
+  local ARCHIVE="$1" dry_run="$2"
+  command -v dpkg >/dev/null 2>&1 || die 1 "dpkg not found — package restore works on Debian/Pi OS only"
+
+  # find the package list belonging to this archive
+  local base ts pkg=""
+  base="$(basename "$ARCHIVE")"
+  if [[ "$base" =~ ${PREFIX}-backup-([0-9]{8}-[0-9]{6})\.tar ]]; then
+    pkg="$DEST/${PREFIX}-packages-${BASH_REMATCH[1]}.txt"
+  fi
+  if [[ ! -f "$pkg" ]]; then
+    pkg="$(find "$DEST" -maxdepth 1 -type f -name "${PREFIX}-packages-*.txt" 2>/dev/null | sort | tail -1)"
+  fi
+  [[ -n "$pkg" && -f "$pkg" ]] || die 1 "No package list found for this backup.
+  (package lists are only saved when PKG_LIST=true in the config)"
+
+  info "Package list: $(basename "$pkg")"
+
+  # packages marked install that are missing on the current system
+  local missing=() p
+  while IFS=$'\t' read -r p _state; do
+    [[ -n "$p" ]] || continue
+    if ! dpkg-query -W -f='${db:Status-Abbrev}' "$p" 2>/dev/null | grep -q '^ii'; then
+      missing+=("$p")
+    fi
+  done < "$pkg"
+
+  if (( ${#missing[@]} == 0 )); then
+    ok "All packages from this backup are already installed."
+    return 0
+  fi
+
+  info "Packages to install (${#missing[@]}):"
+  local name
+  for name in "${missing[@]}"; do
+    printf '    %s\n' "$name"
+  done
+
+  if (( dry_run )); then
+    hint "[dry-run] would run: apt-get install <those packages>"
+    return 0
+  fi
+  confirm "Install these ${#missing[@]} packages with apt-get now?" || { warn "Skipped package install"; return 0; }
+  apt-get update -y
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -- "${missing[@]}"
+  ok "Package restore complete"
+}
+
+
+# ============================================================================
+#  pi-backup delete [name] [--force]
+# ============================================================================
+cmd_delete() {
+  local name="" force=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --force|-f) force=1 ;;
+      -*)         usage_err "delete: unknown option $1" ;;
+      *)          name="$1" ;;
+    esac
+    shift
+  done
+  load_conf "$CONF_FILE"
+  ensure_root
+
+  local f=""
+  if [[ -n "$name" ]]; then
+    f="$(resolve_archive "$name")" || return $?
+  elif whiptail_available; then
+    list_archives
+    (( ${#ARCHIVE_LIST[@]} )) || die 1 "Nothing to delete in $DEST"
+    local rows=() i=1 a
+    for a in "${ARCHIVE_LIST[@]}"; do
+      rows+=("$i" "$(basename "$a"),$(human_size "$(stat -c %s "$a" 2>/dev/null || echo 0)")")
+      i=$(( i + 1 ))
+    done
+    local pick
+    pick="$(whiptail --title "Delete a backup" --menu "Which one?" 20 70 10 \
+            "${rows[@]}" 3>&1 1>&2 2>&3)" || die 1 "Cancelled."
+    f="${ARCHIVE_LIST[pick-1]}"
+  else
+    usage_err "delete: name an archive (see: pi-backup list)"
+  fi
+
+  if (( ! force )); then
+    confirm "Delete $(basename "$f") + its .sha256/.manifest ($(human_size "$(stat -c %s "$f" 2>/dev/null || echo 0)"))?" \
+      || die 1 "Cancelled."
+  fi
+  rm -f "$f" "$f.sha256" "$(manifest_of "$f")"
+  ok "Deleted $(basename "$f")"
+}
+
+# ============================================================================
+#  pi-backup status — one-screen dashboard
+# ============================================================================
+cmd_status() {
+  load_conf "$CONF_FILE"
+  echo ""
+  printf "  %b🍓 pi-backup status%b  %bv%s%b\n" "$C_B" "$C_0" "$C_D" "$VERSION" "$C_0"
+  printf "  Host        : %s\n" "$(hostname 2>/dev/null || echo '?')"
+  printf "  Config      : %s\n" "$CONF_FILE"
+  printf "  Prefix      : %s\n" "$PREFIX"
+  printf "  Destination : %s\n" "$DEST"
+
+  if [[ -d "$DEST" ]]; then
+    list_archives
+    local total=0 size f
+    for f in "${ARCHIVE_LIST[@]}"; do
+      size="$(stat -c %s "$f" 2>/dev/null || echo 0)"
+      total=$(( total + size ))
+    done
+    printf "  Backups     : %s (%s total)\n" "${#ARCHIVE_LIST[@]}" "$(human_size "$total")"
+    printf "  Free there  : %s\n" "$(human_size "$(free_bytes "$DEST" 2>/dev/null || echo 0)")"
+    if (( ${#ARCHIVE_LIST[@]} )); then
+      local latest="${ARCHIVE_LIST[0]}"
+      printf "  Latest      : %s  (%s)\n" "$(basename "$latest")" "$(date -r "$latest" '+%F %T' 2>/dev/null || echo '?')"
+      local m
+      m="$(manifest_of "$latest")"
+      if [[ -f "$m" ]]; then
+        printf "  Last run    : verified=%s  tar_rc=%s  duration=%ss\n" \
+          "$(manifest_value verify "$m")" "$(manifest_value tar_rc "$m")" "$(manifest_value duration "$m")"
+      fi
+    fi
+    printf "  Retention   : keep %s day(s), never below %s\n" "$RETAIN_DAYS" "$RETAIN_MIN"
+    [[ -n "$SERVICES_STOP" ]] && printf "  Stop/start  : %s\n" "$SERVICES_STOP"
+  else
+    printf "  ${C_Y}Destination %s does not exist yet${C_0}\n" "$DEST"
+  fi
+
+  printf "  Includes    : %s\n" "$INCLUDES"
+  printf "  Excludes    : %s\n" "$EXCLUDES"
+  scheduler_show
+  printf "  Log         : %s\n" "$LOG_FILE"
+  echo ""
+}
+
+# ============================================================================
+#  pi-backup doctor — triage in one command
+# ============================================================================
+cmd_doctor() {
+  local fails=0
+
+  chk_rc_ok() { printf "  ${C_G}✓${C_0} %-26s %s\n" "$1" "$2"; }
+  chk_rc_bad() { printf "  ${C_R}✗${C_0} %-26s %s\n" "$1" "$2"; fails=$(( fails + 1 )); }
+  chk_warn() { printf "  ${C_Y}⚠${C_0} %-26s %s\n" "$1" "$2"; }
+
+  load_conf "$CONF_FILE"
+
+  echo ""
+  printf "  %b🩺 pi-backup doctor%b  %bv%s%b\n" "$C_B" "$C_0" "$C_D" "$VERSION" "$C_0"
+
+  # ── config ──
+  chk_rc_ok "config readable" "$CONF_FILE"
+
+  # ── destination ──
+  if [[ -d "$DEST" ]]; then
+    chk_rc_ok "destination exists" "$DEST"
+    if [[ -w "$DEST" ]]; then
+      chk_rc_ok "destination writable" "$DEST"
+    else
+      chk_rc_bad "destination writable" "no write permission for $DEST"
+    fi
+    local dev_dest dev_root
+    dev_dest="$(stat -Lc %d "$DEST" 2>/dev/null)"
+    dev_root="$(stat -Lc %d /)"
+    if [[ "$dev_dest" != "$dev_root" ]]; then
+      chk_rc_ok "separate storage" "not on the root filesystem"
+    elif [[ "$ALLOW_ROOT_DEV" == "true" ]]; then
+      chk_warn "separate storage" "disabled (ALLOW_ROOT_DEV=true)"
+    else
+      chk_rc_bad "separate storage" "$DEST is on the root filesystem"
+    fi
+    chk_rc_ok "free space at dest" "$(human_size "$(free_bytes "$DEST" 2>/dev/null || echo 0)")"
+  else
+    chk_rc_bad "destination exists" "$DEST — create it or re-run the wizard"
+  fi
+
+  # ── tools ──
+  local d
+  for d in tar sha256sum flock stat du find df; do
+    if command -v "$d" >/dev/null 2>&1; then
+      chk_rc_ok "tool: $d" "$(command -v "$d")"
+    else
+      chk_rc_bad "tool: $d" "missing"
+    fi
+  done
+  if [[ "$SCHEDULER" == "systemd" ]]; then
+    if command -v systemctl >/dev/null 2>&1; then
+      chk_rc_ok "systemd present" "$(systemctl --version 2>/dev/null | head -1)"
+    else
+      chk_rc_bad "systemd present" "missing but SCHEDULER=systemd"
+    fi
+  fi
+
+  # ── scheduler ──
+  if [[ "$SCHEDULER" == "systemd" ]] && command -v systemctl >/dev/null 2>&1; then
+    if [[ -f "/etc/systemd/system/$(unit_timer)" ]]; then
+      if systemctl is-enabled "$(unit_timer)" >/dev/null 2>&1; then
+        chk_rc_ok "timer enabled" "$(schedule_human)"
+      else
+        chk_rc_bad "timer enabled" "$(unit_timer) not enabled — sudo pi-backup schedule install"
+      fi
+    else
+      chk_rc_bad "timer installed" "$(unit_timer) missing — sudo pi-backup schedule install"
+    fi
+  elif [[ "$SCHEDULER" == "cron" ]]; then
+    if command -v crontab >/dev/null 2>&1 && crontab -l 2>/dev/null | grep -Fq "$(cron_marker)"; then
+      chk_rc_ok "cron installed" "$(schedule_human)"
+    else
+      chk_rc_bad "cron installed" "no pi-backup entry — sudo pi-backup schedule install"
+    fi
+  fi
+
+  # ── archives ──
+  list_archives
+  if (( ${#ARCHIVE_LIST[@]} )); then
+    chk_rc_ok "backups present" "${#ARCHIVE_LIST[@]} in $DEST"
+    if archive_checksum_ok "${ARCHIVE_LIST[0]}"; then
+      chk_rc_ok "latest verified" "$(basename "${ARCHIVE_LIST[0]}")"
+    else
+      chk_warn "latest verified" "no checksum/checksum mismatch — run: pi-backup verify latest"
+    fi
+  else
+    chk_warn "backups present" "none yet — run: sudo pi-backup backup"
+  fi
+
+  # ── stop/start sanity ──
+  if [[ -n "$SERVICES_STOP" ]] && ! command -v systemctl >/dev/null 2>&1; then
+    chk_warn "service stop hooks" "SERVICES_STOP set but systemctl is missing"
+  elif [[ -n "$SERVICES_STOP" ]]; then
+    local svc bad_svc=""
+    for svc in $SERVICES_STOP; do
+      if ! systemctl list-unit-files 2>/dev/null | grep -q "^$svc\.service"; then
+        bad_svc="$bad_svc $svc"
+      fi
+    done
+    if [[ -n "$bad_svc" ]]; then
+      chk_warn "service stop hooks" "unknown unit(s):$bad_svc"
+    else
+      chk_rc_ok "service stop hooks" "$SERVICES_STOP"
+    fi
+  else
+    chk_rc_ok "service stop hooks" "none configured"
+  fi
+
+  echo ""
+  if (( fails )); then
+    err "$fails problem(s) found — fix items marked ✗ above"
+    return 1
+  fi
+  ok "All essential checks passed."
+}
+
+
+# ============================================================================
+#  pi-backup config [show|set KEY VALUE|edit]
+# ============================================================================
+cmd_config() {
+  local sub="${REST[0]:-show}"
+  case "$sub" in
+    show)
+      [[ -r "$CONF_FILE" ]] || die 4 "No config at $CONF_FILE — run: sudo pi-backup wizard"
+      echo ""
+      printf "%b\n" "${C_B}pi-backup configuration${C_0}  ${C_D}${CONF_FILE}${C_0}"
+      echo ""
+      grep -vE '^[[:space:]]*#|^[[:space:]]*$' "$CONF_FILE" | sed 's/^/    /'
+      echo ""
+      hint "Change a value:  sudo pi-backup config set KEY VALUE"
+      hint "Full wizard:     sudo pi-backup wizard"
+      ;;
+    edit)
+      [[ -r "$CONF_FILE" ]] || die 4 "No config at $CONF_FILE — run: sudo pi-backup wizard"
+      command -v "${EDITOR:-vi}" >/dev/null 2>&1 || die 1 "\$EDITOR not installed (tried ${EDITOR:-vi})"
+      load_conf "$CONF_FILE"   # remember current schedule in case it changes
+      local old_sched="$SCHEDULE|$HOUR|$DOW|$DOM|$SCHEDULER"
+      "${EDITOR:-vi}" "$CONF_FILE"
+      load_conf "$CONF_FILE"
+      ok "Config updated."
+      local new_sched="$SCHEDULE|$HOUR|$DOW|$DOM|$SCHEDULER"
+      if [[ "$old_sched" != "$new_sched" ]]; then
+        hint "Schedule changed — re-install it:  sudo pi-backup schedule install"
+      fi
+      ;;
+    set)
+      local key="${REST[1]:-}" val="${REST[2]:-}"
+      [[ -n "$key" && -n "$val" ]] || usage_err "config set needs KEY and VALUE"
+      [[ -r "$CONF_FILE" ]] || die 4 "No config at $CONF_FILE — run the wizard first"
+      load_conf "$CONF_FILE"
+      _is_conf_key "$key" || die 4 "Unknown setting \"$key\" — valid keys:
+  PREFIX DEST INCLUDES EXCLUDES RETAIN_DAYS RETAIN_MIN COMPRESS VERIFY
+  PKG_LIST SCHEDULER SCHEDULE HOUR DOW DOM RANDOM_DELAY SERVICES_STOP
+  LOG_FILE ALLOW_ROOT_DEV"
+      case "$key" in
+        PREFIX)         PREFIX="$val" ;;
+        DEST)           DEST="$val" ;;
+        INCLUDES)       INCLUDES="$val" ;;
+        EXCLUDES)       EXCLUDES="$val" ;;
+        RETAIN_DAYS)    RETAIN_DAYS="$val" ;;
+        RETAIN_MIN)     RETAIN_MIN="$val" ;;
+        COMPRESS)       COMPRESS="$val" ;;
+        VERIFY)         VERIFY="$val" ;;
+        PKG_LIST)       PKG_LIST="$val" ;;
+        SCHEDULER)      SCHEDULER="$val" ;;
+        SCHEDULE)       SCHEDULE="$val" ;;
+        HOUR)           HOUR="$val" ;;
+        DOW)            DOW="$val" ;;
+        DOM)            DOM="$val" ;;
+        RANDOM_DELAY)   RANDOM_DELAY="$val" ;;
+        SERVICES_STOP)  SERVICES_STOP="$val" ;;
+        LOG_FILE)       LOG_FILE="$val" ;;
+        ALLOW_ROOT_DEV) ALLOW_ROOT_DEV="$val" ;;
+      esac
+      local old_sched="${SCHEDULE}|${HOUR}|${DOW}|${DOM}|${SCHEDULER}"
+      validate_conf
+      save_conf
+      ok "$key = $val"
+      if [[ "$key" == SCHEDULE || "$key" == HOUR || "$key" == DOW || "$key" == DOM || "$key" == SCHEDULER ]]; then
+        hint "Schedule changed — re-install it:  sudo pi-backup schedule install"
+      fi
+      ;;
+    *) usage_err "config: use show|set|edit" ;;
+  esac
+}
+
+# ============================================================================
+#  pi-backup schedule [install|show|remove]
+# ============================================================================
+cmd_schedule() {
+  local sub="${REST[0]:-show}"
+  load_conf "$CONF_FILE"
+  ensure_root
+  case "$sub" in
+    install)
+      if scheduler_install; then
+        ok "Schedule installed: $(schedule_human)  ($SCHEDULER)"
+        [[ "$SCHEDULER" == "systemd" ]] && hint "Check: systemctl list-timers $(unit_timer)"
+      else
+        die 1 "Schedule installation failed — see messages above"
+      fi ;;
+    show)   scheduler_show ;;
+    remove) scheduler_remove; ok "Schedule removed — automatic backups are OFF" ;;
+    *)      usage_err "schedule: use install|show|remove" ;;
+  esac
+}
+
+# ============================================================================
+#  pi-backup uninstall [--purge]
+# ============================================================================
+cmd_uninstall() {
+  local purge=0 a
+  for a in "${REST[@]+"${REST[@]}"}"; do
+    case "$a" in
+      --purge) purge=1 ;;
+      -*)      usage_err "uninstall: unknown option $a" ;;
+      *)       usage_err "uninstall takes only --purge" ;;
+    esac
+  done
+  if [[ -r "$CONF_FILE" ]]; then
+    load_conf "$CONF_FILE"   # knows DEST/SCHEDULER for messages
+  fi
+  ensure_root
+
+  info "Stopping schedule…"
+  scheduler_remove
+  if [[ -f "$BIN_PATH" ]]; then
+    rm -f "$BIN_PATH"
+    ok "Removed $BIN_PATH"
+  fi
+  if (( purge )); then
+    confirm "Also delete the configuration at $CONF_FILE? (backups in \$DEST are NEVER touched)" || purge=0
+  fi
+  if (( purge )) && [[ "$CONF_FILE" == /etc/pi-backup/* ]]; then
+    rm -f "$CONF_FILE"
+    rmdir "$(dirname "$CONF_FILE")" 2>/dev/null || true
+    ok "Removed config $CONF_FILE"
+  elif (( purge )); then
+    hint "Config at $CONF_FILE kept (outside /etc/pi-backup — delete manually if desired)"
+  fi
+  ok "pi-backup uninstalled. Your backups in ${DEST:-DEST-unset} were NOT touched."
+}
+
+# ============================================================================
+#  pi-backup update — refresh this CLI from GitHub
+# ============================================================================
+cmd_update() {
+  ensure_root
+  command -v curl >/dev/null 2>&1 || die 1 "curl is required for pi-backup update"
+  info "Fetching latest pi-backup from GitHub…"
+  local tmp
+  tmp="$(mktemp)" || die 1 "mktemp failed"
+  if ! curl -fsSL "$UPSTREAM_URL" -o "$tmp"; then
+    rm -f "$tmp"
+    die 1 "Download failed — check your network connection"
+  fi
+  if ! bash -n "$tmp" 2>/dev/null; then
+    rm -f "$tmp"
+    die 1 "Downloaded file failed the syntax check — refusing to install it"
+  fi
+  local old_sha new_sha
+  old_sha="$(sha256sum "$BIN_PATH" 2>/dev/null | awk '{print $1}')"
+  new_sha="$(sha256sum "$tmp" | awk '{print $1}')"
+  if [[ -n "$old_sha" && "$old_sha" == "$new_sha" ]]; then
+    ok "Already up to date (pi-backup $VERSION)"
+    rm -f "$tmp"
+    return 0
+  fi
+  chmod 755 "$tmp"
+  mv "$tmp" "$BIN_PATH" || die 1 "Could not replace $BIN_PATH"
+  local now_ver
+  now_ver="$("$BIN_PATH" version | awk '{print $2}')"
+  ok "Updated to pi-backup $now_ver — next scheduled backup runs with it automatically."
+}
+
+
+# ============================================================================
+#  pi-backup wizard
+# ============================================================================
+cmd_wizard() {
+  if ! whiptail_available && [[ "${PI_BACKUP_BATCH:-0}" != "1" ]]; then
+    # try to help repair — whiptail is standard on Pi OS but sometimes stripped
+    if command -v apt-get >/dev/null 2>&1; then
+      info "Installing whiptail (needed for the wizard)…"
+      apt-get install -y whiptail >/dev/null 2>&1 || true
+    fi
+    if ! whiptail_available; then
+      die 1 "The wizard needs a terminal (whiptail is installed automatically).
+  Headless install instead?
+    ${C_B}PI_BACKUP_BATCH=1 sudo bash pi-backup-install.sh${C_0}"
+    fi
+  fi
+
+  if [[ -r "$CONF_FILE" ]]; then
+    load_conf "$CONF_FILE"
+    info "Existing config found at $CONF_FILE — the answers below are your current settings."
+    echo ""
+  elif [[ -n "${PI_BACKUP_MIGRATED_DEST:-}" ]]; then
+    # prefills coming from a detected v1 installation
+    [[ -n "${PI_BACKUP_MIGRATED_PREFIX:-}" ]]     && PREFIX="${PI_BACKUP_MIGRATED_PREFIX}"
+    [[ -n "${PI_BACKUP_MIGRATED_DEST:-}" ]]       && DEST="${PI_BACKUP_MIGRATED_DEST}"
+    [[ -n "${PI_BACKUP_MIGRATED_RETAIN:-}" ]]     && RETAIN_DAYS="${PI_BACKUP_MIGRATED_RETAIN}"
+    [[ -n "${PI_BACKUP_MIGRATED_INCLUDES:-}" ]]   && INCLUDES="${PI_BACKUP_MIGRATED_INCLUDES}"
+    info "Migrating settings from your old v1 pi-backup installation."
+  fi
+
+  printf "\n%b🍓 pi-backup wizard%b  %bv%s%b\n" "$C_C$C_B" "$C_0" "$C_D" "$VERSION" "$C_0"
+  printf "%b  Seven quick questions and you're done.%b\n\n" "$C_C" "$C_0"
+
+  # ── batch (headless) mode — no prompts, straight from env vars ───────────
+  if [[ "${PI_BACKUP_BATCH:-0}" == "1" ]]; then
+    DEST="${PI_BACKUP_DEST:-$DEST}"
+    PREFIX="${PI_BACKUP_PREFIX:-$PREFIX}"
+    INCLUDES="${PI_BACKUP_INCLUDES:-$INCLUDES}"
+    EXCLUDES="${PI_BACKUP_EXCLUDES:-$EXCLUDES}"
+    COMPRESS="${PI_BACKUP_COMPRESS:-$COMPRESS}"
+    RETAIN_DAYS="${PI_BACKUP_RETAIN_DAYS:-$RETAIN_DAYS}"
+    RETAIN_MIN="${PI_BACKUP_RETAIN_MIN:-$RETAIN_MIN}"
+    SCHEDULE="${PI_BACKUP_SCHEDULE:-$SCHEDULE}"
+    HOUR="${PI_BACKUP_HOUR:-$HOUR}"
+    DOW="${PI_BACKUP_DOW:-$DOW}"
+    DOM="${PI_BACKUP_DOM:-$DOM}"
+    RANDOM_DELAY="${PI_BACKUP_RANDOM_DELAY:-$RANDOM_DELAY}"
+    SCHEDULER="${PI_BACKUP_SCHEDULER:-$SCHEDULER}"
+    VERIFY="${PI_BACKUP_VERIFY:-$VERIFY}"
+    PKG_LIST="${PI_BACKUP_PKG_LIST:-$PKG_LIST}"
+    SERVICES_STOP="${PI_BACKUP_SERVICES_STOP:-$SERVICES_STOP}"
+    [[ -n "$DEST" ]] || die 4 "Batch mode needs PI_BACKUP_DEST=/your/backup/path"
+    validate_conf
+    mkdir -p "$DEST" || die 1 "Could not create batch destination $DEST"
+    save_conf
+    ok "Configuration saved to $CONF_FILE"
+    if scheduler_install; then
+      ok "Schedule installed: $(schedule_human)  ($SCHEDULER)"
+    else
+      warn "Schedule not installed — run: sudo pi-backup schedule install"
+    fi
+    hint "Try it now:  sudo pi-backup backup"
+    return 0
+  fi
+
+  # ── STEP 1 — destination ─────────────────────────────────────────────────
+  wizard_step_dest || die 1 "Cancelled."
+  mkdir -p "$DEST" || die 1 "Could not create $DEST"
+
+  # ── STEP 2 — prefix ──────────────────────────────────────────────────────
+  ask_text "Pi Backup — Step 2 of 7" \
+    "Name prefix for your backups.
+Example: 'kev' → kev-backup-20250401-020000.tar.gz" 9 60 "$PREFIX" || die 1 "Cancelled."
+  PREFIX="$(printf '%s' "$_WT_VAL" | tr -c -s '[:alnum:]-_' '-' | sed 's/^-//;s/-$//')"
+
+  # ── STEP 3 — includes ────────────────────────────────────────────────────
+  wizard_step_includes || die 1 "Cancelled."
+
+  # ── STEP 4 — excludes ────────────────────────────────────────────────────
+  wizard_step_excludes || die 1 "Cancelled."
+
+  # ── STEP 5 — schedule ────────────────────────────────────────────────────
+  wizard_step_schedule || die 1 "Cancelled."
+
+  # ── STEP 6 — retention & extras ──────────────────────────────────────────
+  wizard_step_options || die 1 "Cancelled."
+
+  # ── STEP 7 — confirm & save ──────────────────────────────────────────────
+  wizard_summary_prompt || die 1 "Cancelled — nothing was changed."
+  validate_conf
+  save_conf
+  ok "Configuration saved to $CONF_FILE"
+
+  if scheduler_install; then
+    ok "Schedule installed: $(schedule_human)  ($SCHEDULER)"
+  else
+    warn "Schedule could not be installed — run later with: sudo pi-backup schedule install"
+  fi
+
+  wizard_test_run_prompt
+}
+
+wizard_step_dest() {
+  # radiolist of detected mounts (flash drives/SSDs typically) + custom
+  local rows=() default_in_row=0 mnt size fst sz_h label
+  while read -r mnt size fst; do
+    case "$mnt" in
+      /|/boot|/var|/usr|/proc|/sys|/dev|/run|/snap*) continue ;;
+    esac
+    case "$fst" in
+      ext4|ext3|ext2|vfat|exfat|ntfs|btrfs|f2fs|xfs|fuseblk) ;;
+      *) continue ;;
+    esac
+    sz_h="$(human_size "$size")"
+    label="${sz_h} on ${mnt} ($fst)"
+    rows+=("$mnt" "$label" "off")
+    [[ "$mnt" == "$DEST" ]] && { rows[${#rows[@]}-1]="on"; default_in_row=1; }
+  done < <(df -B1 --output=target,size,fstype -x tmpfs -x devtmpfs -x squashfs \
+             -x overlay -x efivarfs -x proc -x sysfs 2>/dev/null | tail -n +2)
+  rows+=("custom" "type a full path instead" "off")
+  if (( ! default_in_row )); then
+    [[ "${DEST:-}" != /* ]] && DEST="/mnt/usb-backup"
+  fi
+
+  ask_radio "Pi Backup — Step 1 of 7" \
+    "Where should backups live?
+
+Detected mounts below. Pick one, or choose 'custom'." 20 70 8 "${rows[@]}" || return 1
+  if [[ "$_WT_VAL" == "custom" ]]; then
+    ask_text "Pi Backup — Step 1 of 7" \
+      "Full path for backups (ideally on an external drive):
+" 9 60 "$DEST" || return 1
+    DEST="$_WT_VAL"
+  else
+    DEST="$_WT_VAL"
+  fi
+  [[ "$DEST" == /* ]] || { err "Destination must be an absolute path"; return 1; }
+}
+
+wizard_step_includes() {
+  local rows=() item on out
+
+  while read -r item; do
+    [[ -e "$item" ]] || continue
+    on="off"
+    case ",$INCLUDES," in
+      *",${item#/},"*) on="on" ;;
+    esac
+    case "$item" in
+      /etc)             rows+=("$item" "system configuration"        "$on") ;;
+      /home)            rows+=("$item" "user files"                  "$on") ;;
+      /usr/local/bin)   rows+=("$item" "custom scripts & binaries"   "$on") ;;
+      /opt)             rows+=("$item" "optional software"           "$on") ;;
+      /srv)             rows+=("$item" "server/web data"             "$on") ;;
+      /root)            rows+=("$item" "root's home"                 "$on") ;;
+      /var/www)         rows+=("$item" "web server files"            "$on") ;;
+    esac
+  done < <(printf '%s\n' /etc /home /usr/local/bin /opt /srv /root /var/www)
+
+  # /boot(/firmware) exactly once — whichever this OS uses
+  local bootdir=""
+  [[ -d /boot/firmware ]] && bootdir="/boot/firmware"
+  [[ -z "$bootdir" && -d /boot ]] && bootdir="/boot"
+  if [[ -n "$bootdir" ]]; then
+    on="off"
+    case ",$INCLUDES," in *",${bootdir#/},"*) on="on" ;; esac
+    rows+=("$bootdir" "Pi firmware (config.txt, cmdline)" "$on")
+  fi
+
+  ask_check "Pi Backup — Step 3 of 7" \
+    "Which directories should be backed up?
+[SPACE] toggles · [ENTER] confirms" 18 62 10 "${rows[@]}" || return 1
+  out="$(clean_whiptail_list "$_WT_VAL")"
+
+  ask_text "Custom include paths" \
+    "Any extra paths to INCLUDE? Comma-separated, e.g.
+/home/keshav/projects,/etc/mycerts
+
+Empty = none." 9 60 "" || : ;   # cancelled → treat as none
+  [[ -n "${_WT_VAL:-}" ]] && out="${out:+$out,}$(clean_whiptail_list "$_WT_VAL")"
+
+  # validate every path: strip /, dedupe, warn missing
+  split_csv "$out"
+  local valid=() seen="," p rel
+  for p in "${CSV_ITEMS[@]}"; do
+    [[ -z "$p" ]] && continue
+    rel="${p#/}"
+    if [[ ! -e "/$rel" ]]; then
+      warn "Skipping missing path /$rel"
+      continue
+    fi
+    case "$seen" in *",${rel},"*) continue ;; esac
+    seen="${seen}${rel},"
+    valid+=("$rel")
+  done
+  (( ${#valid[@]} )) || { err "At least one directory must be selected"; return 1; }
+  INCLUDES="$(join_csv "${valid[@]}")"
+}
+
+wizard_step_excludes() {
+  local rows=() pattern desc on
+  local patterns=()
+  patterns+=("home/*/.cache|user caches (~/.cache*/*)")
+  patterns+=("home/*/.local/share/Trash|user Trash folders")
+  patterns+=("home/*/.npm|npm caches")
+  patterns+=("var/lib/docker|Docker images/containers (restore your registry instead)")
+  patterns+=("var/tmp|volatile /var/tmp files")
+
+  for pattern in "${patterns[@]}"; do
+    desc="${pattern#*|}"
+    pattern="${pattern%%|*}"
+    on="off"
+    case ",$EXCLUDES," in *",${pattern},"*) on="on" ;; esac
+    rows+=("$pattern" "$desc" "$on")
+  done
+
+  ask_check "Pi Backup — Step 4 of 7" \
+    "Exclude patterns (silently skipped inside the backup)" 18 66 6 "${rows[@]}" || return 1
+  local out
+  out="$(clean_whiptail_list "$_WT_VAL")"
+
+  ask_text "Custom excludes" \
+    "Additional exclude globs? Comma-separated, e.g.
+home/keshav/media/huge-video-library
+
+Empty = none." 9 60 "" || :
+  [[ -n "${_WT_VAL:-}" ]] && out="${out:+$out,}$(clean_whiptail_list "$_WT_VAL")"
+
+  split_csv "$out"
+  local valid=() seen="," p
+  for p in "${CSV_ITEMS[@]}"; do
+    [[ -z "$p" ]] && continue
+    case "$seen" in *",${p},"*) continue ;; esac
+    seen="${seen}${p},"
+    valid+=("$p")
+  done
+  EXCLUDES="$(join_csv "${valid[@]}")"
+}
+
+wizard_step_schedule() {
+  ask_menu "Pi Backup — Step 5 of 7" "How often should backups run?" 12 56 3 \
+    "daily"   "Every day" \
+    "weekly"  "Once a week (recommended)" \
+    "monthly" "Once a month" || return 1
+  SCHEDULE="$_WT_VAL"
+
+  ask_menu "Pi Backup — Step 5 of 7" "What hour (24h clock)?" 18 50 12 \
+    "0" "midnight"  "1" "1 AM"  "2" "2 AM" "3" "3 AM" "4" "4 AM" \
+    "5" "5 AM"      "6" "6 AM"  "7" "7 AM" "18" "6 PM" "20" "8 PM" \
+    "21" "9 PM"     "22" "10 PM" "23" "11 PM" || return 1
+  HOUR="$_WT_VAL"
+
+  ask_menu "Pi Backup — Step 5 of 7" "Which scheduler?" 12 62 2 \
+    "systemd" "systemd timer — recommended; catches up if the Pi was off" \
+    "cron"    "classic cron entry" || return 1
+  SCHEDULER="$_WT_VAL"
+
+  case "$SCHEDULE" in
+    weekly)
+      ask_menu "Pi Backup — Step 5 of 7" "Which day?" 14 45 7 \
+        "0" "Sunday"  "1" "Monday"  "2" "Tuesday" "3" "Wednesday" \
+        "4" "Thursday" "5" "Friday" "6" "Saturday" || return 1
+      DOW="$_WT_VAL" ;;
+    monthly)
+      ask_menu "Pi Backup — Step 5 of 7" "Which day of the month?" 16 45 6 \
+        "1" "1st" "7" "7th" "10" "10th" "14" "14th" "21" "21st" "28" "28th" || return 1
+      DOM="$_WT_VAL" ;;
+  esac
+
+  ask_menu "Pi Backup — Step 5 of 7" \
+    "Random delay? Spreads the load if you back up several Pis at once." 14 60 4 \
+    "0"   "none — exactly on the hour" \
+    "15"  "±15 minutes (recommended)" \
+    "60"  "±1 hour" \
+    "120" "±2 hours" || return 1
+  RANDOM_DELAY="$_WT_VAL"
+}
+
+wizard_step_options() {
+  ask_menu "Pi Backup — Step 6 of 7" "How long to keep old backups?" 16 50 6 \
+    "14"  "14 days" "30" "30 days" "60" "60 days" \
+    "90"  "90 days" "180" "6 months" "365" "1 year" || return 1
+  RETAIN_DAYS="$_WT_VAL"
+
+  local comp_rows=("gzip" "compress .tar.gz (industry standard)" "on")
+  if command -v zstd >/dev/null 2>&1; then
+    comp_rows+=("zstd" "compress .tar.zst (3-4× faster, smaller)" "on")
+  fi
+  comp_rows+=("none" "no compression (fastest to write, biggest)" "off")
+  ask_radio "Pi Backup — Step 6 of 7" "Compression method:" 13 62 3 "${comp_rows[@]}" || return 1
+  COMPRESS="$_WT_VAL"
+
+  local pkgs_on="on" ver_on="on" svcs=() svc_on
+  [[ "$PKG_LIST" == "false" ]] && pkgs_on="off"
+  [[ "$VERIFY" == "false" ]]   && ver_on="off"
+
+  ask_check "Pi Backup — Step 6 of 7" "Extras:" 12 60 3 \
+    "pkgs"   "Save installed-package list (great for restoring deps)" "$pkgs_on" \
+    "verify" "Verify archive right after writing it" "$ver_on" || return 1
+  local opts
+  opts="$(clean_whiptail_list "$_WT_VAL")"
+  PKG_LIST="false"; [[ "$opts" == *"pkgs"* ]]   && PKG_LIST="true"
+  VERIFY="false";   [[ "$opts" == *"verify"* ]] && VERIFY="true"
+
+  # services to stop during the backup (databases etc.) — raspiBackup-style
+  svcs=()
+  if command -v systemctl >/dev/null 2>&1; then
+    local svc known=(mariadb mysql postgresql docker snapd)
+    for svc in "${known[@]}"; do
+      svc_on="off"
+      systemctl list-unit-files --type=service 2>/dev/null | grep -q "^${svc}\.service" || continue
+      case " $SERVICES_STOP " in *" $svc "*) svc_on="on" ;; esac
+      svcs+=("$svc" "currently installed/enabled" "$svc_on")
+    done
+  fi
+  if (( ${#svcs[@]} )); then
+    ask_check "Pi Backup — Step 6 of 7" \
+      "Stop any services during the backup?
+(safer for databases; they restart automatically after)" 16 62 6 "${svcs[@]}" || :
+    if [[ -n "${_WT_VAL:-}" ]]; then
+      SERVICES_STOP="$(printf '%s' "$(clean_whiptail_list "$_WT_VAL")" | tr -s ' ' ' ' | sed 's/^ //;s/ $//')"
+    fi
+  fi
+  ask_text "Services to stop (continued)" \
+    "Any additional service names to stop during backup?
+
+Comma or space separated. Empty = none." 9 60 "" || :
+  if [[ -n "${_WT_VAL:-}" ]]; then
+    local extra
+    extra="$(printf '%s' "$_WT_VAL" | tr ',' ' ' | tr -s ' ' ' ')"
+    SERVICES_STOP="$(printf '%s %s' "$SERVICES_STOP" "$extra" | tr -s ' ' ' ' | sed 's/^ //;s/ $//')"
+  fi
+}
+
+wizard_summary_prompt() {
+  local txt
+  txt="Ready to save:
+
+  Destination : $DEST
+  Prefix      : $PREFIX
+  Includes    : $INCLUDES
+  Excludes    : $EXCLUDES
+  Schedule    : $(schedule_human)  ($SCHEDULER)
+  Retention   : keep $RETAIN_DAYS d, never below $RETAIN_MIN
+  Compression : $COMPRESS
+  Verify      : $VERIFY
+  Package list: $PKG_LIST"
+  [[ -n "$SERVICES_STOP" ]] && txt="$txt
+  Stop/start  : $SERVICES_STOP"
+  txt="$txt
+
+Plus per backup: sha256 checksum + manifest.
+Save and install?"
+  ask_yesno "Pi Backup — Step 7 of 7" "$txt" 24 64
+}
+
+wizard_test_run_prompt() {
+  ask_yesno "Test run" "All set! Run a test backup right now to make sure everything works?" 9 60 || return 0
+  echo ""
+  info "Running backup (verbose) — this may take several minutes…"
+  echo ""
+  "$BIN_PATH" backup -v || true
+  echo ""
+  if ask_yesno "Done" "View the log?" 7 40; then
+    ${PAGER:-less} "$LOG_FILE"
+  fi
+}
+
+
+# ============================================================================
+#  pi-backup help / version
+# ============================================================================
+cmd_help() {
+  cat <<EOF
+🍓 pi-backup v$VERSION — one-command backup & restore for Raspberry Pi
+
+USAGE
+  pi-backup COMMAND [args]
+
+SETUP
+  wizard                  Interactive configuration (7 quick questions)
+  schedule install|show|remove
+  config show|set KEY VALUE|edit
+
+EVERY DAY
+  backup [-q|-v]          Create a backup now (safe on a live system)
+  list [--json]           Show backups in the destination
+  verify [name|latest|all]
+  delete [name]           Delete a backup (+ sidecars)
+  status                  One-screen health dashboard
+  doctor                  Preflight checks with human fixes
+
+WHEN THINGS GO WRONG
+  restore [name]          Restore from an archive (interactive)
+  restore --target DIR    Extract full archive into a directory (system untouched)
+  restore --paths LIST    Restore selected paths onto / (e.g. etc/nginx)
+  restore --packages      Reinstall packages from a saved package list
+  restore --what? -> help Restore flags: --everything --force --dry-run
+                                 --no-verify --no-snapshot --latest --yes
+
+HOUSEKEEPING
+  uninstall [--purge]     Uninstall (backups are NEVER touched)
+  update                  Update pi-backup itself from GitHub
+
+EXAMPLES
+  sudo pi-backup backup
+  sudo pi-backup list
+  sudo pi-backup restore latest --target /mnt/recovered
+  sudo pi-backup restore pi-backup-20260101-020000 --paths etc/nginx,home/keshav
+  sudo pi-backup verify all
+
+Exit codes: 0 ok · 2 usage · 3 lock/busy · 4 config · 5 space · 6 tar · 7 verify
+Docs: https://github.com/keshavsapra/pi-backup
+EOF
+}
+
+cmd_version() { printf 'pi-backup %s\n' "$VERSION"; }
+
+# ============================================================================
+#  main — parse global flags anywhere on the line, dispatch the subcommand
+# ============================================================================
+main() {
+  local a seen_sub=0
+  for a in "$@"; do
+    if (( ! seen_sub )); then
+      case "$a" in
+        -q|--quiet)     QUIET=1 ;;
+        -v|--verbose)   VERBOSE=1 ;;
+        -y|--yes)       ASSUME_YES=1 ;;
+        -h|--help)      SUB="help"; seen_sub=1 ;;
+        -V|--version)   SUB="version"; seen_sub=1 ;;
+        -*)             usage_err "unknown option \"$a\"";;
+        *)              SUB="$a"; seen_sub=1 ;;
+      esac
+    else
+      case "$a" in
+        -q|--quiet)   QUIET=1 ;;
+        -v|--verbose) VERBOSE=1 ;;
+        -y|--yes)     ASSUME_YES=1 ;;
+        -h|--help)    SUB="help" ;;
+        -V|--version) cmd_version; exit 0 ;;
+        *)            REST+=("$a") ;;
+      esac
+    fi
+  done
+
+  case "$SUB" in
+    help)    cmd_help ;;
+    version) cmd_version ;;
+    wizard)  cmd_wizard ;;
+    backup)  cmd_backup ;;
+    list)    cmd_list ;;
+    verify)  cmd_verify ;;
+    restore) cmd_restore "${REST[@]+"${REST[@]}"}" ;;
+    delete)  cmd_delete "${REST[@]+"${REST[@]}"}" ;;
+    status)  cmd_status ;;
+    doctor)  cmd_doctor ;;
+    config)  cmd_config ;;
+    schedule) cmd_schedule ;;
+    uninstall) cmd_uninstall ;;
+    update)  cmd_update ;;
+    "")
+      if [[ -r "$CONF_FILE" ]]; then
+        cmd_help
+      else
+        cmd_help
+        echo ""
+        hint "First time? Run the wizard:  ${C_B}sudo pi-backup wizard${C_0}"
+      fi
+      ;;
+    *) usage_err "unknown command: $SUB" ;;
+  esac
+}
+
+main "$@"
+
+
