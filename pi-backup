@@ -614,10 +614,6 @@ services_stop() {
   fi
   local svc
   for svc in $SERVICES_STOP; do
-    if ! systemctl is-enabled "$svc" >/dev/null 2>&1 && ! systemctl is-active --quiet "$svc"; then
-      blog "Service $svc not found/running — nothing to stop"
-      continue
-    fi
     if systemctl is-active --quiet "$svc"; then
       if systemctl stop "$svc"; then
         STOPPED_SERVICES+=("$svc")
@@ -626,7 +622,7 @@ services_stop() {
         blog "WARN: could not stop service $svc (continuing)"
       fi
     else
-      blog "Service $svc is already inactive"
+      blog "Service $svc is already inactive — nothing to stop"
     fi
   done
 }
@@ -1159,7 +1155,6 @@ restore_to_system() { # restore_to_system ARCHIVE PATHS DRY RUN_SNAPSHOT
   local ARCHIVE="$1" want_paths="$2" dry_run="$3" want_snapshot="$4"
 
   if [[ -z "$want_paths" ]]; then
-    # "everything" mode: restore all top-level members from the archive
     if [[ "$RESTORE_MODE" != "everything" ]] && whiptail_available; then
       want_paths="$(restore_pick_paths_ui "$ARCHIVE")" || die 1 "Cancelled."
       [[ -n "$want_paths" ]] || die 1 "Cancelled — nothing selected."
@@ -1201,9 +1196,7 @@ restore_pick_paths_ui() { # checklist of top-level members
   local i=0
   while IFS= read -r item; do
     [[ -n "$item" ]] || continue
-    if (( i < 12 )); then
-      rows+=("$item" "restore" "off")
-    fi
+    rows+=("$item" "restore" "off")
     i=$(( i + 1 ))
   done < <(top_level_members "$ARCHIVE")
   (( ${#rows[@]} )) || die 1 "Could not list the archive's contents"
@@ -1431,7 +1424,11 @@ cmd_doctor() {
   printf "  %b🩺 pi-backup doctor%b  %bv%s%b\n" "$C_B" "$C_0" "$C_D" "$VERSION" "$C_0"
 
   # ── config ──
-  chk_rc_ok "config readable" "$CONF_FILE"
+  if [[ -r "$CONF_FILE" ]]; then
+    chk_rc_ok "config readable" "$CONF_FILE"
+  else
+    chk_rc_bad "config readable" "$CONF_FILE — missing or unreadable"
+  fi
 
   # ── destination ──
   if [[ -d "$DEST" ]]; then
@@ -1550,6 +1547,7 @@ cmd_config() {
       hint "Full wizard:     sudo pi-backup wizard"
       ;;
     edit)
+      ensure_root
       [[ -r "$CONF_FILE" ]] || die 4 "No config at $CONF_FILE — run: sudo pi-backup wizard"
       command -v "${EDITOR:-vi}" >/dev/null 2>&1 || die 1 "\$EDITOR not installed (tried ${EDITOR:-vi})"
       load_conf "$CONF_FILE"   # remember current schedule in case it changes
@@ -1563,6 +1561,7 @@ cmd_config() {
       fi
       ;;
     set)
+      ensure_root
       local key="${REST[1]:-}" val="${REST[2]:-}"
       [[ -n "$key" && -n "$val" ]] || usage_err "config set needs KEY and VALUE"
       [[ -r "$CONF_FILE" ]] || die 4 "No config at $CONF_FILE — run the wizard first"
@@ -1697,6 +1696,7 @@ cmd_update() {
 #  pi-backup wizard
 # ============================================================================
 cmd_wizard() {
+  ensure_root
   if ! whiptail_available && [[ "${PI_BACKUP_BATCH:-0}" != "1" ]]; then
     # try to help repair — whiptail is standard on Pi OS but sometimes stripped
     if command -v apt-get >/dev/null 2>&1; then
@@ -2090,8 +2090,8 @@ WHEN THINGS GO WRONG
   restore --target DIR    Extract full archive into a directory (system untouched)
   restore --paths LIST    Restore selected paths onto / (e.g. etc/nginx)
   restore --packages      Reinstall packages from a saved package list
-  restore --what? -> help Restore flags: --everything --force --dry-run
-                                 --no-verify --no-snapshot --latest --yes
+  restore flags: --everything --force --dry-run --no-verify
+                                 --no-snapshot --latest --yes
 
 HOUSEKEEPING
   uninstall [--purge]     Uninstall (backups are NEVER touched)
